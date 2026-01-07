@@ -1,0 +1,31 @@
+# Python 通用忽略规则
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm 编辑器忽略规则
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+build/
+
+# 临时文件
+*.tmp
+*.log
+*.pid
+*.seed
+*.coverage
+
+# MIDI 测试文件（如果有不需要提交的输出文件，也可以加）
+*.mid
+*.midi
