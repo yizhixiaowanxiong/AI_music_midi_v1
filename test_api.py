@@ -1,7 +1,7 @@
 import os
 from http.client import responses
 
-from openai import OpenAI, base_url
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()

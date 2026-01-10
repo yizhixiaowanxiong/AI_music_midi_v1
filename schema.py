@@ -1,10 +1,14 @@
-from pydantic import BaseModel,Field
+from pydantic import BaseModel,Field,field_validator
 from typing import List,Optional,Literal
 
-# 1.Literal类似一种枚举常量，强制值必须是其中之一
-InstrumentType = Literal["piano", "bass", "drum", "synth_lead", "strings"]
-ScaleType = Literal["major", "minor", "dorian", "phrygian"]
+# 1. 乐器/调式枚举
+InstrumentType = Literal["piano", "bass", "drum", "synth_lead", "synth_pad", "strings", "fx"]
+ScaleType = Literal["major", "minor", "dorian", "phrygian", "lydian"]
 
+# new-1.结构标记
+class SectionMarker(BaseModel):
+    name: Literal["Intro", "Verse", "Build-up", "Drop", "Breakdown", "Outro"] = Field(..., description="段落名称")
+    start_time:int=Field(...,description="该段落开始的时间",ge=0)
 # 2.定义音符结构
 class NoteSchema(BaseModel):
     """
@@ -16,9 +20,14 @@ class NoteSchema(BaseModel):
     start_time: int = Field(..., description="相对于当前小节开始的绝对时间 (ticks)", ge=0)
 # 3.定义自动化控制
 class AutomationSchema(BaseModel):
-    type: Literal["cutoff", "resonance", "volume"] = Field(..., description="控制参数类型")
-    start_val: int = Field(0, ge=0, le=127)
+    """
+        CC信号
+    """
+    type: Literal["volume", "pan", "cutoff", "resonance"] = Field(..., description="控制参数类型")
+    start_val: int = Field(..., ge=0, le=127)
     end_val: int = Field(127, ge=0, le=127)
+    start_time:int = Field(...,description="变化开始时间")
+    duration:int = Field(...,description="持续时间")
     curve: Literal["linear", "exponential"] = "linear"
 # 4.定义轨道结构
 class TrackSchema(BaseModel):
@@ -27,9 +36,12 @@ class TrackSchema(BaseModel):
     """
     name: str = Field(..., description="轨道名称, 如 'Bass Line'")
     instrument: InstrumentType = Field(..., description="使用的乐器类型")
-    notes: List[NoteSchema] = Field(..., description="该轨道包含的所有音符列表")
-    automation: Optional[AutomationSchema] = Field(None, description="可选的自动化控制参数")
-# 5.定义整体编曲结构
+    notes: List[NoteSchema] = Field(default_factory=list, description="该轨道包含的所有音符列表（容错：默认空列表）")
+    automations: Optional[List[AutomationSchema]] = Field(default_factory=list)
+    # loop_count (循环次数) 和 pattern_length (单次循环的长度)。
+    loop_count: int = Field(default=1, description="Number of times to repeat this pattern")
+    pattern_length: int = Field(default=0, description="Length of the loop in ticks (e.g. 1920 for 4 beats)")
+# 5.总谱定义
 class ArrangementSchema(BaseModel):
     """
         要求 LLM 返回的最终 JSON 结构
@@ -38,7 +50,18 @@ class ArrangementSchema(BaseModel):
     bpm: int = Field(120, description="速度 Beats Per Minute", ge=60, le=200)
     scale: ScaleType = Field("minor", description="调式")
     root_note: str = Field("C", description="根音, 如 C, D#, F")
+    total_bars:int = Field(...,description="总小节数")
+    sections:List[SectionMarker]=Field(...,description="歌曲结构标记列表")
     tracks: List[TrackSchema] = Field(..., description="包含的所有轨道列表")
+
+    @field_validator('sections')
+    @classmethod
+    def check_sections(cls,section):
+        if not section:
+            raise ValueError("必须定义歌曲结构")
+        return section
+
+
 
 
 # if __name__ == "__main__":
