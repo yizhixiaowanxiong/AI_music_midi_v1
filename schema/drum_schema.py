@@ -49,7 +49,7 @@ class DrumsSectionOutput(BaseModel):
 
     # CHANGED: meter/timebase 从 blueprint 传进来，而不是写死
     time_signature: str = Field("4/4", description="e.g. '4/4', '3/4', '6/8'")
-    ticks_per_beat: int = Field(480, ge=24, le=1920, description="PPQ/TPB")
+    ticks_per_beat: int = 480
     bar_ticks: int = Field(0, ge=1, description="computed if 0")
 
     strictness: Strictness = 1

@@ -21,5 +21,5 @@ def print_report(bp: SongBlueprint):
     print("✅ QC Passed（Pydantic 校验已通过）")
 
 if __name__ == "__main__":
-    bp = SongBlueprint(**json.load(open("blueprint.json", "r", encoding="utf-8")))
+    bp = SongBlueprint(**json.load(open("json_all/blueprint.json", "r", encoding="utf-8")))
     print_report(bp)

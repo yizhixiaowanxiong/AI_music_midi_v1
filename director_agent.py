@@ -120,5 +120,5 @@ if __name__ == "__main__":
     agent = DirectorAgent()
     prompt = "写一首悲伤的 Deep House，总共 32 小节，C minor，包含 Intro 8、Build-up 8、Drop 16。"
     bp = agent.generate_blueprint(prompt)
-    open("blueprint.json", "w", encoding="utf-8").write(bp.model_dump_json(indent=2, ensure_ascii=False))
+    open("json_all/blueprint.json", "w", encoding="utf-8").write(bp.model_dump_json(indent=2, ensure_ascii=False))
     print("✅ blueprint.json 已生成")
