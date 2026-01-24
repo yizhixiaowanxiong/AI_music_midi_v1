@@ -49,6 +49,12 @@ class DirectorAgent:
             "- role must be one of: silent,background,support,lead,solo.\n"
             "- variant_tag must be one of: mute,core,light,full,build,break,fill.\n"
             "- groove_global.feel must be one of: tight,neutral,laid_back.\n"
+            "\n"
+            "Additional guidance for higher musicality and single-instrument writing:\n"
+            "- Intro: avoid a single-chord loop for 8 bars; use at least 2 chords or longer chord_rhythm (2bar/4bar).\n"
+            "- Build-up: the final phrase should hint a motif (lead light) or stronger chord stabs.\n"
+            "- Drop: fx should be 'fill' or 'full' to support transitions.\n"
+            "- Provide more specific playing_style text for each instrument (avoid 'none' unless role is silent).\n"
             "Return json now."
         )
 

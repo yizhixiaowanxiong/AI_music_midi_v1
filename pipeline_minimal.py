@@ -1,5 +1,4 @@
 # pipeline_minimal.py
-import json
 from director_agent import DirectorAgent
 from agents.drums_agent import DrumsAgent
 from agents.bass_agent import BassAgent
