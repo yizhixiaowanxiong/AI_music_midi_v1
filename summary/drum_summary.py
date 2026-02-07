@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Set, Tuple, Optional
-from schema.drum_schema import DrumsSectionOutput, DrumNote
-
+from schema.drum_schema import DrumsSectionOutput
+from track_builder import flatten_section
 
 # ==========================================
 # 公共工具：拍号/时值推导（全流程统一复用）
@@ -12,7 +12,6 @@ def _parse_time_signature(ts: str) -> Tuple[int, int]:
         return int(n), int(d)
     except Exception:
         return 4, 4
-
 
 def compute_bar_ticks(out: DrumsSectionOutput) -> int:
     """
@@ -33,84 +32,16 @@ def compute_bar_ticks(out: DrumsSectionOutput) -> int:
     except Exception:
         return tpb * 4
 
-
-def _safe_note_copy(note: DrumNote) -> DrumNote:
-    # Pydantic v2: model_copy; v1: copy
-    if hasattr(note, "model_copy"):
-        return note.model_copy()
-    return note.copy()
-
-
-def _get_pattern_len_bars(out: DrumsSectionOutput, pattern) -> int:
-    """
-    兼容 pattern_len_bars 既可能在 section_out，也可能未来下放到 pattern。
-    """
-    for attr in ("pattern_len_bars", "len_bars"):
-        v = getattr(pattern, attr, None)
-        if isinstance(v, int) and v > 0:
-            return v
-
-    v = getattr(out, "pattern_len_bars", None)
-    if isinstance(v, int) and v > 0:
-        return v
-
-    return 4
-
-
 # ==========================================
 # 核心：Pattern+Phrase -> 线性绝对时间音符
 # ==========================================
 
-def flatten_drum_section(out: DrumsSectionOutput) -> List[DrumNote]:
+def flatten_drum_section(out: DrumsSectionOutput) -> List:
     """
-    将结构化的 Pattern+Phrase 展开为线性音符（相对 section_start_bar）。
-    关键策略：phrase 必须完全落在 section 内，否则跳过（避免相位错）。
+    Compatibility wrapper: reuse track_builder.flatten_section.
+    Returned NoteEvent fields match DrumNote usage (pitch/start_tick/duration_tick/velocity).
     """
-    flat: List[DrumNote] = []
-
-    tpb = int(getattr(out, "ticks_per_beat", 480) or 480)
-    bar_ticks = compute_bar_ticks(out) or (tpb * 4)
-
-    sec_start = int(out.section_start_bar)
-    sec_end = int(out.section_end_bar)
-
-    pattern_map = {p.tag: p for p in out.patterns}
-
-    for ph in out.phrases:
-        pat = pattern_map.get(ph.use_pattern_tag)
-        if not pat:
-            continue
-
-        # phrase 必须完全落在 section 内，否则跳过（最稳，避免节奏相位错）
-        if ph.start_bar < sec_start or ph.end_bar > sec_end:
-            continue
-
-        phrase_len = int(ph.end_bar - ph.start_bar + 1)
-        if phrase_len <= 0:
-            continue
-
-        pat_len = _get_pattern_len_bars(out, pat)
-        if pat_len <= 0:
-            pat_len = 4
-
-        phrase_abs_start_tick = (int(ph.start_bar) - sec_start) * bar_ticks
-        phrase_abs_end_tick = phrase_abs_start_tick + phrase_len * bar_ticks  # exclusive
-
-        cur_bar = 0
-        while cur_bar < phrase_len:
-            loop_tick = phrase_abs_start_tick + cur_bar * bar_ticks
-            for note in pat.notes:
-                new_note = _safe_note_copy(note)
-                abs_tick = loop_tick + int(note.start_tick)
-                if abs_tick >= phrase_abs_end_tick:
-                    continue
-                new_note.start_tick = abs_tick
-                flat.append(new_note)
-            cur_bar += pat_len
-
-    flat.sort(key=lambda n: n.start_tick)
-    return flat
-
+    return flatten_section(out)
 
 # ==========================================
 # 网格相关：1/16 量化 + 文本渲染
@@ -134,12 +65,10 @@ def _kick_steps(kick_ticks: List[int], total_bars: int, bar_ticks: int, tpb: int
                 s.add((b, step))
     return s
 
-
 def _render_bar_16(kick_step_set: Set[Tuple[int, int]], bar_idx: int, bar_ticks: int, tpb: int) -> str:
     step_tick = max(1, int(tpb // 4))
     steps_per_bar = max(1, int(bar_ticks // step_tick))
     return "".join("K" if (bar_idx, i) in kick_step_set else "." for i in range(steps_per_bar))
-
 
 def _render_full_grid(
     kick_step_set: Set[Tuple[int, int]],
@@ -199,7 +128,6 @@ def _render_full_grid(
 
     return "\n".join(lines)
 
-
 def _break_bars(kick_ticks: List[int], total_bars: int, bar_ticks: int) -> List[int]:
     """
     返回 section 内 1-based 的 break bars（整小节没有 kick）。
@@ -213,7 +141,6 @@ def _break_bars(kick_ticks: List[int], total_bars: int, bar_ticks: int) -> List[
             has[b] = True
     return [i + 1 for i, v in enumerate(has) if not v]
 
-
 def _density_desc(kick_ticks: List[int], total_bars: int) -> str:
     avg = len(kick_ticks) / max(1, total_bars)
     if avg >= 3.5:
@@ -221,7 +148,6 @@ def _density_desc(kick_ticks: List[int], total_bars: int) -> str:
     if avg >= 2:
         return "Standard Groove"
     return "Sparse"
-
 
 # ==========================================
 # 统一入口：mode = "min" | "full"

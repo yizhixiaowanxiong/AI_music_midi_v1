@@ -35,7 +35,7 @@ class InstrumentInstruction(BaseModel):
     role: Literal["silent", "background", "support", "lead", "solo"] = Field(..., description="乐器角色")  #乐器地位
     playing_style: str = Field(..., description="演奏风格建议（文字）") #演奏风格
     energy_level: float = Field(..., ge=0.0, le=1.0, description="该乐器在该段的能量/强度") #强度
-    variant_tag: VariantTag = Field("core", description="建议使用的变体标签") #变体标签，默认初始核心
+    variant_tag: VariantTag = Field("../core", description="建议使用的变体标签") #变体标签，默认初始核心
 # 乐段定义
 class Section(BaseModel):
     name: SectionName #小节名字
