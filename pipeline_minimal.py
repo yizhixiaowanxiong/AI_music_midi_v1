@@ -1,34 +1,78 @@
-# pipeline_minimal.py
-from agents.director_agent import DirectorAgent
-from agents.drums_agent import DrumsAgent
-from agents.bass_agent import BassAgent
-from summary.drum_summary import summarize_drums_for_bass
-from track_builder import drums_to_track, bass_to_track
+import asyncio
+import json
+from pathlib import Path
+
+from graph.adapter import LangGraphAdapter
 from midi_renderer import render_tracks_to_midi
-
-def main():
-    # 1) Blueprint
-    director = DirectorAgent()
-    bp = director.generate_blueprint("写一首悲伤的 Deep House，总共 32 小节，C minor，包含 Intro 8、Build-up 8、Drop 16。")
-    open("data/json_all/blueprint.json", "w", encoding="utf-8").write(bp.model_dump_json(indent=2, ensure_ascii=False))
-
-    # 2) Drums (Drop)
-    drums_agent = DrumsAgent()
-    drums = drums_agent.generate_for_section(bp, bp.sections[2])
-    drum_summary = summarize_drums_for_bass(drums, mode="min")
+from schema.concept import SongConcept
+from track_builder import bass_to_track, drums_to_track
 
 
-    # 3) Bass (reads kick summary)
-    bass_agent = BassAgent()
-    bass = bass_agent.generate_bass_for_section(bp, bp.sections[2], drum_summary)
+async def main():
+    user_request = (
+        "Write a melancholic deep house track, 32 bars total, C minor, "
+        "with Intro 8, Build-up 8, Drop 16."
+    )
 
-    # 4) Render to MIDI
-    drums_track = drums_to_track(drums)
-    bass_track = bass_to_track(bass)
-    render_tracks_to_midi([drums_track, bass_track], bpm=bp.bpm, out_path="data/midi_all/demo_drums_bass.mid")
+    adapter = LangGraphAdapter()
 
-    print("✅ Generated: blueprint.json + demo_drums_bass.mid")
-    print("👉 用 FL Studio 导入 MIDI（Piano roll -> MIDI Import）试听。")  # FL 导入 MIDI :contentReference[oaicite:7]{index=7}
+    # 第一步：生成 concept，并停在审核门。
+    status = await adapter.start_run(user_request=user_request, strictness=1)
+    run_id = status["run_id"]
+    concept = SongConcept.model_validate(status.get("concept") or {})
+    duration = adapter.suggest_duration_sec(concept)
+
+    # 第二步：用户确认 concept，流程继续到 blueprint + section 生成。
+    await adapter.submit_concept_review(
+        approved=True,
+        user_confirmed_duration_sec=duration,
+        run_id=run_id,
+    )
+    result = await adapter.get_run_result(run_id=run_id)
+    if not result.get("ready"):
+        raise RuntimeError(
+            f"Run not ready. phase={result.get('phase')} error={result.get('last_error')}"
+        )
+
+    blueprint_payload = result.get("blueprint") or {}
+    out_json = Path("data/json_all/blueprint.json")
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(
+        json.dumps(blueprint_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    tracks_by_section = result.get("tracks") or {}
+    first_section_key = next(iter(tracks_by_section.keys()), None)
+    if not first_section_key:
+        raise RuntimeError("No tracks were generated.")
+
+    tracks = tracks_by_section[first_section_key]
+    midi_tracks = []
+    for track in tracks:
+        role = str(track.get("instrument", "")).lower()
+        raw = track.get("raw_output")
+        if raw is None:
+            continue
+        if role in ("percussion", "drums"):
+            midi_tracks.append(drums_to_track(raw))
+        elif role == "bass":
+            midi_tracks.append(bass_to_track(raw))
+
+    if midi_tracks:
+        bpm = int(((blueprint_payload.get("concept") or {}).get("bpm")) or 120)
+        render_tracks_to_midi(
+            tracks=midi_tracks,
+            bpm=bpm,
+            out_path="data/midi_all/demo_drums_bass.mid",
+            strictness=1,
+        )
+
+    print("Generated: blueprint.json + demo_drums_bass.mid")
+    print("Backend: langgraph")
+    print(f"Run ID: {run_id}")
+    print(f"Concept: {concept.title}")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

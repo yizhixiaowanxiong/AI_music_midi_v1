@@ -1,132 +1,100 @@
 # bass_agent.py
-import os, json, re, time
-from pathlib import Path
-from dotenv import load_dotenv
-from openai import OpenAI
+"""Bass Agent：负责低音轨生成与鼓点上下文对齐。"""
+
+import json
 from pydantic import ValidationError
+from typing import List
 
+from agents.musician_llm_agent import MusicianLlmAgent
+from schema.arrangement import GeneratedTrack, TrackGenRequest
+from schema.base import NoteEvent
 from schema.bass_schema import BassSectionOutput
-
-load_dotenv()
-
-TPB = 480
+from utils.constants import MIDI_CHANNEL_BASS, TPB
+from utils.json_tools import to_dict as _to_dict
+from utils.notes import to_note_events
+from utils.token_budget import get_section_max_tokens
 
 import copy
 
 
-def _to_dict(obj):
-    if isinstance(obj, dict):
-        return {k: _to_dict(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_to_dict(x) for x in obj]
-    if hasattr(obj, "model_dump"):
-        return _to_dict(obj.model_dump())
-    if hasattr(obj, "dict"):
-        return _to_dict(obj.dict())
-    return obj
+class BassAgent(MusicianLlmAgent):
+    """低音生成 Agent。"""
 
-def _find_json_start(text: str) -> int:
-    if not text:
-        return -1
-    i_obj = text.find("{")
-    i_arr = text.find("[")
-    idxs = [i for i in (i_obj, i_arr) if i != -1]
-    return min(idxs) if idxs else -1
-
-def _extract_first_json_object(text: str) -> str:
-    if not text:
-        return ""
-    start = text.find("{")
-    if start == -1:
-        return ""
-    in_str = False
-    escape = False
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return ""
-
-def _clean_json_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.strip()
-    if "```" in text:
-        pattern = r"```(?:json)?\s*(.*?)\s*```"
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            text = match.group(1)
-    extracted = _extract_first_json_object(text)
-    return extracted or text
-
-class BassAgent:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
+        super().__init__(log_prefix="bass")
+
+    def _to_note_events(self, out: BassSectionOutput) -> List[NoteEvent]:
+        return to_note_events(out)
+
+    async def generate(self, req: TrackGenRequest) -> GeneratedTrack:
+        """将调度请求转换为 bass 段落生成，并返回标准轨道结果。"""
+        scale_name = None
+        if getattr(req, "scale", None) is not None:
+            scale_name = getattr(req.scale, "name", None) or str(req.scale)
+
+        blueprint = {
+            "bpm": req.bpm,
+            "root_note": req.root_note or "",
+            "scale": scale_name or "",
+        }
+
+        section = {
+            "name": req.section_name,
+            "start_bar": req.start_bar,
+            "end_bar": req.end_bar,
+            "len_bars": req.end_bar - req.start_bar + 1,
+            "global_energy": req.energy_level if req.energy_level is not None else 0.7,
+            "chord_progression": req.chord_progression or [],
+            "chord_rhythm": req.chord_rhythm or "4bar",
+            "time_signature": req.time_signature,
+        }
+
+        design = {}
+        if getattr(req, "design", None) is not None:
+            if hasattr(req.design, "model_dump"):
+                design = req.design.model_dump()
+            else:
+                design = req.design
+
+        ctx = req.context
+        # 来自 drums 的 runtime context，用于避开 kick 强拍冲突。
+        drums_summary = {
+            "kick_onsets_ticks": getattr(ctx, "kick_onsets_ticks", []) if ctx else [],
+            "llm_context_text": getattr(ctx, "kick_summary_text", "") if ctx else "",
+        }
+
+
+        bass_out = await self.generate_bass_for_section(
+            blueprint,
+            section,
+            design,
+            drums_summary,
+            track_key=req.track_key,
+            strictness=getattr(req, "strictness", 1),
         )
-        self.model = os.getenv("MODEL_NAME")
-        self._log_dir = Path("data/logs")
-        self._log_dir.mkdir(parents=True, exist_ok=True)
-
-    def _call_json(self, system: str, user: str, max_tokens: int = 2000, temperature: float = 0.25) -> dict:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            response_format={"type":"json_object"},
-            temperature=temperature,
-            max_tokens=max_tokens,
+        return GeneratedTrack(
+            track_key=req.track_key,
+            instrument=req.instrument,
+            section_name=req.section_name,
+            channel=int(req.midi_channel) if req.midi_channel is not None else MIDI_CHANNEL_BASS,
+            notes=self._to_note_events(bass_out),
+            raw_output=bass_out,
         )
-        content = resp.choices[0].message.content or ""
-        self._log_raw_llm("bass_raw", content)
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            cleaned = _clean_json_text(content)
-            self._log_raw_llm("bass_cleaned", cleaned)
-            try:
-                return json.loads(cleaned)
-            except json.JSONDecodeError:
-                start = _find_json_start(cleaned)
-                if start != -1:
-                    obj, _ = json.JSONDecoder().raw_decode(cleaned[start:])
-                    return obj
-                raise
 
-    def _log_raw_llm(self, prefix: str, text: str) -> None:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        path = self._log_dir / f"{prefix}_{ts}.txt"
-        try:
-            path.write_text(text, encoding="utf-8")
-        except Exception:
-            pass
-
-    def generate_bass_for_section(
+    async def generate_bass_for_section(
         self,
         blueprint: dict,
         section: dict,
-        drums_summary: dict,     # 你刚做的 summarize_drums_for_bass(..., mode="min") 的返回值
+        design: dict,
+        drums_summary: dict,
+        track_key: str = "bass",
         strictness: int = 1,
         retries: int = 2,
     ) -> 'BassSectionOutput':
+        """生成单段 bass 结构化输出（pattern + phrase）。"""
         blueprint = _to_dict(blueprint)
         section = _to_dict(section)
+        design = _to_dict(design)
         section_len = section["end_bar"] - section["start_bar"] + 1
         time_signature = section.get("time_signature") or blueprint.get("time_signature") or "4/4"
         bar_ticks = int(section.get("bar_ticks", 0) or 0)
@@ -136,52 +104,47 @@ class BassAgent:
 
         system = (
             "You are a Deep House / Tech House bassline writer.\n"
-            "Return JSON only (valid json).\n"
-            "Goal: tight low-end with the drums.\n"
+            "Return JSON only.\n"
             "Rules:\n"
-            "- Output must match the given output schema example.\n"
-            "- pattern_len_bars in {1,2,4,8}; prefer 4.\n"
-            "- notes are relative to pattern start: start_tick in [0, pattern_len_bars*bar_ticks).\n"
-            "- Keep bass mostly on grid (1/16) with short notes; allow longer notes on break bars.\n"
-            "- IMPORTANT: Use the provided Kick Summary to avoid placing strong bass attacks exactly on kick steps.\n"
-            "- On Kick Break bars (no kick), bass may sustain or do a simple riff.\n"
-            "- Prefer chord tones (root/5th/3rd) of the current chord progression.\n"
-            "Return json now."
+            "- pattern_len_bars must be one of 1,2,4,8.\n"
+            "- note.start_tick must be inside one pattern cycle.\n"
+            "- phrases must fully cover section bars without overlap.\n"
+            "- phrase tags must exist in patterns.\n"
+            "- Follow chord progression; prefer root/5th/3rd on strong beats.\n"
+            "- Use Kick Summary to avoid strong bass attacks exactly on kick steps.\n"
+            "- strictness 0/1/2 means creative/balanced/stable.\n"
         )
 
         # 给 LLM 一个清晰的“长什么样”
         example = {
-            "track_key": "bass",
-            "section_name": "Drop",
-            "section_start_bar": 17,
-            "section_end_bar": 32,
+            "track_key": track_key,
+            "section_name": section["name"],
+            "section_start_bar": section["start_bar"],
+            "section_end_bar": section["end_bar"],
             "time_signature": time_signature,
             "ticks_per_beat": TPB,
             "bar_ticks": bar_ticks,
             "strictness": 1,
-            "pattern_len_bars": 4,
+            "pattern_len_bars": 1,
             "patterns": [
                 {
                     "tag": "core",
                     "notes": [
-                        {"pitch": 36, "start_tick": 240, "duration_tick": 120, "velocity": 105},  # C2
-                        {"pitch": 36, "start_tick": 720, "duration_tick": 120, "velocity": 100},
-                    ],
-                },
-                {
-                    "tag": "break",
-                    "notes": [
-                        {"pitch": 36, "start_tick": 0, "duration_tick": 1920, "velocity": 90}
+                        {"pitch": 36, "start_tick": 240, "duration_tick": 120, "velocity": 105},
                     ],
                 }
             ],
             "phrases": [
-                {"start_bar": 17, "end_bar": 28, "use_pattern_tag": "core"},
-                {"start_bar": 29, "end_bar": 32, "use_pattern_tag": "core"}
-            ]
+                {"start_bar": section["start_bar"], "end_bar": section["end_bar"], "use_pattern_tag": "core"}
+            ],
         }
 
         user = {
+            "target_track": {
+                "track_key": track_key,
+                "role": "bass",
+                "instrument_design": design,
+            },
             "blueprint_global": {
                 "bpm": blueprint["bpm"],
                 "root_note": blueprint["root_note"],
@@ -205,15 +168,34 @@ class BassAgent:
 
         last_err = None
         for i in range(retries + 1):
-            data = self._call_json(system, prompt, max_tokens=2400, temperature=0.25 if i == 0 else 0.15)
+            budget_tokens = get_section_max_tokens("bass", section_len, i)
+            try:
+                data = await self._call_json(
+                    system,
+                    prompt,
+                    max_tokens=budget_tokens,
+                    temperature=0.25 if i == 0 else 0.15,
+                )
+            except json.JSONDecodeError as e:
+                # JSON 语法异常时，给模型显式修复指令并重试。
+                last_err = e
+                fix_payload = copy.deepcopy(user)
+                fix_payload["fix_instruction"] = (
+                    "Your previous output was not valid JSON. "
+                    "Return ONLY a single valid JSON object. "
+                    "Use double quotes, include all required commas, and no extra text."
+                )
+                fix_payload["previous_json_error"] = str(e)
+                prompt = json.dumps(fix_payload, ensure_ascii=False)
+                continue
             try:
                 return BassSectionOutput(**data)
             except ValidationError as e:
+                # Schema 不匹配时，保留原上下文并要求仅修正非法字段。
                 last_err = e
                 fix_payload = copy.deepcopy(user)
                 fix_payload["fix_instruction"] = "Fix ONLY invalid/missing fields. Keep all valid fields unchanged. Return FULL corrected JSON only."
-                fix_payload["previous_validation_error"] = str(e)
-                fix_payload["previous_json"] = data
+                fix_payload["previous_validation_error"] = str(e)[:600]
                 prompt = json.dumps(fix_payload, ensure_ascii=False)
 
         raise RuntimeError(f"Validation failed after retries: {last_err}")

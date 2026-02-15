@@ -1,4 +1,5 @@
-from typing import List, Dict, Any, Set, Tuple, Optional
+from typing import List, Dict, Any, Set, Tuple, Optional, Iterable
+from utils.constants import KICK_PITCHES
 from schema.drum_schema import DrumsSectionOutput
 from track_builder import flatten_section
 
@@ -149,11 +150,34 @@ def _density_desc(kick_ticks: List[int], total_bars: int) -> str:
         return "Standard Groove"
     return "Sparse"
 
+def _compress_ranges(nums: Iterable[int]) -> str:
+    """
+    Compress sorted numbers into ranges: [1,2,3,7,8] -> "1-3,7-8".
+    """
+    arr = sorted({int(n) for n in nums if int(n) > 0})
+    if not arr:
+        return "None"
+
+    parts: List[str] = []
+    start = prev = arr[0]
+    for n in arr[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = n
+    parts.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(parts)
+
 # ==========================================
 # 统一入口：mode = "min" | "full"
 # ==========================================
 
-def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict[str, Any]:
+def summarize_drums_for_bass(
+    out: DrumsSectionOutput,
+    mode: str = "min",
+    kick_pitches: Optional[Iterable[int]] = None,
+) -> Dict[str, Any]:
     """
     mode:
       - "min": LLM 语义优先，输出更短（推荐默认）
@@ -163,8 +187,12 @@ def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict
     if mode not in ("min", "full"):
         mode = "min"
 
+    if kick_pitches is None:
+        kick_pitches = KICK_PITCHES
+    kick_set = {int(p) for p in kick_pitches}
+
     flat = flatten_drum_section(out)
-    kick_ticks = [int(n.start_tick) for n in flat if int(n.pitch) == 36]
+    kick_ticks = [int(n.start_tick) for n in flat if int(n.pitch) in kick_set]
 
     tpb = int(getattr(out, "ticks_per_beat", 480) or 480)
     ts = getattr(out, "time_signature", "4/4") or "4/4"
@@ -176,6 +204,7 @@ def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict
 
     breaks = _break_bars(kick_ticks, total_bars, bar_ticks)
     density = _density_desc(kick_ticks, total_bars)
+    breaks_comp = _compress_ranges(breaks)
 
     # 统一给到代码层的“可复用结构”：
     # 即使你当前不写硬规则，也方便未来扩展
@@ -191,7 +220,7 @@ def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict
             start_bar_abs=sec_start,
             time_signature=ts,
         )
-        breaks_text = f"Kick Breaks (no kick): {breaks if breaks else 'None'}"
+        breaks_text = f"Kick Breaks (no kick): {breaks_comp}"
         llm_text = (
             f"Kick Drum Pattern [{out.section_name}] ({density}) [time_signature={ts}]:\n"
             f"{grid}\n"
@@ -199,28 +228,24 @@ def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict
             "Legend: K=kick, .=silence. Grid is 1/16-note; spacing follows beats."
         )
     else:
-        # min：只给最多 4 个“代表性 bar”
-        picks: List[int] = []
-        if total_bars >= 1:
-            picks.append(1)
-        if breaks:
-            picks.append(breaks[0])
-        if total_bars >= 2:
-            picks.append(total_bars)
-        # 去重 + 限制数量
-        picks = list(dict.fromkeys([b for b in picks if 1 <= b <= total_bars]))[:4]
-
-        examples = []
-        for b in picks:
+        # min: shortest text, 2-3 representative bars
+        examples: List[str] = []
+        seen = set()
+        for b in range(1, total_bars + 1):
             bar_str = _render_bar_16(kick_step_set, b - 1, bar_ticks, tpb)
-            examples.append(f"Bar {b} (Abs {sec_start + b - 1}): {bar_str}")
+            if bar_str in seen:
+                continue
+            seen.add(bar_str)
+            examples.append(f"b{b}={bar_str}")
+            if len(examples) >= 3:
+                break
 
         llm_text = (
-            f"Kick Summary [{out.section_name}] ({density}) [time_signature={ts}]:\n"
-            f"Break bars (no kick): {breaks if breaks else 'None'}\n"
-            f"Examples (1/16):\n" + "\n".join(examples) +
-            "\nLegend: K=kick, .=silence"
+            f"Kick [{out.section_name}] {density} ts={ts}; "
+            f"breaks={breaks_comp}; "
+            f"ex: {'; '.join(examples) if examples else 'None'}"
         )
+
 
     return {
         "section_name": out.section_name,
@@ -231,6 +256,8 @@ def summarize_drums_for_bass(out: DrumsSectionOutput, mode: str = "min") -> Dict
         "bar_ticks": bar_ticks,
         "total_bars": total_bars,
         "break_bars": breaks,
+        "break_ranges": breaks_comp,
+        "kick_pitches": sorted(list(kick_set)),
 
         # 未来写强规则时很方便（可忽略不用）
         "kick_steps": sorted(list(kick_step_set)),  # list[(bar_idx, step_idx)]

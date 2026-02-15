@@ -1,133 +1,110 @@
-# agents/director_agent.py
+"""Director Agent：负责从 concept 生成可执行编曲蓝图。"""
+
+from __future__ import annotations
+
 import json
-from core.base_agent import BaseAgent
-from schema.blueprint_schema import SongBlueprint, Section, PhrasePlan
-from schema.blueprint_skeleton_schema import SongBlueprintSkeleton
+import re
+
+from agents.concept_agent import ConceptAgent
+from agents.llm_base_agent import BaseAgent
+from schema.blueprint_schema import SongBlueprint
+from schema.concept import SongConcept
 
 
 class DirectorAgent(BaseAgent):
+    """编曲导演 Agent，负责 Blueprint 级规划。"""
+
     def __init__(self):
-        super().__init__(system_prompt="You are a professional music director.")
+        super().__init__(system_prompt="You are a professional music director and arranger.")
 
-    def generate_blueprint(self, user_request: str) -> SongBlueprint:
-        schema_json = json.dumps(SongBlueprint.model_json_schema(), indent=2)
+    def _default_duration_from_concept(self, concept: SongConcept) -> float:
+        """从 concept 的建议时长文本中推断默认秒数。"""
+        text = str(getattr(concept, "suggested_duration_range", "") or "")
+        nums = re.findall(r"\d+(?:\.\d+)?", text)
+        if len(nums) >= 2:
+            return (float(nums[0]) + float(nums[1])) / 2.0
+        if len(nums) == 1:
+            return float(nums[0])
+        return 180.0
 
-        musical_rules = (
-            "CRITICAL BUSINESS RULES:\n"
-            "- sections must fully cover 1..total_bars with no overlap.\n"
-            "- Must include Drop and Drop has the highest global_energy.\n"
-            "- chord_progression is a list of chord symbols.\n"
-            "- You MUST set chord_rhythm + repeat so that:\n"
-            "  section_len_bars == len(chord_progression) * bars_per_chord(chord_rhythm) * repeat\n"
-            "- If section_len_bars >= 16, you MUST provide phrases covering the whole section.\n"
-            "\n"
-            "MUSICALITY GUIDANCE (High Priority):\n"
-            "- Intro: avoid a single-chord loop for 8 bars; use at least 2 chords or longer chord_rhythm.\n"
-            "- Build-up: the final phrase should hint a motif (lead light) or stronger chord stabs.\n"
-            "- Drop: fx should be 'fill' or 'full' to support transitions.\n"
-            "- Provide specific playing_style text (avoid 'none' unless role is silent).\n"
-            "- Ensure instruments have varied roles (not everything is 'support').\n"
+    async def agenerate_blueprint_from_concept(
+        self,
+        *,
+        concept: SongConcept,
+        user_request: str,
+        user_confirmed_duration_sec: float,
+    ) -> SongBlueprint:
+        """基于已确认时长与 concept，生成可执行 SongBlueprint。"""
+        concept_json = json.dumps(concept.model_dump(), ensure_ascii=False, indent=2)
+        contract = (
+            "{"
+            '"concept": SongConcept(keep semantically consistent with provided concept),'
+            '"user_confirmed_duration_sec": float,'
+            '"total_bars": int,'
+            '"sections": ['
+            '{"name":str,"index":int,"start_bar":int,"end_bar":int,"bars_count":int,'
+            '"chord_progression":[str],"chord_rhythm":"8bar|4bar|2bar|1bar|2beats|1beat",'
+            '"arrangement":{"<track_key>":{"role":str,"instrument_name":str,"playing_style":str,"mixing_hint":optional str}},'
+            '"transition_to_next":str}'
+            "]"
+            "}"
+        )
+        rules = (
+            "CRITICAL RULES:\n"
+            "- Output ONLY valid JSON.\n"
+            "- Match SongBlueprint exactly.\n"
+            "- Keep concept consistent with the provided concept input.\n"
+            "- user_confirmed_duration_sec must equal the provided confirmed value.\n"
+            "- concept.structure_flow must match sections by order and musical intent.\n"
+            "- sections must fully cover bars 1..total_bars without overlap or gaps.\n"
+            "- For each section, bars_count must equal end_bar - start_bar + 1.\n"
+            "- section.index should be stable and start from 0 (0-based indexing).\n"
+            "- chord_progression must be a list of chord symbols.\n"
+            "- arrangement must include at least drums and bass, and each item must include role/instrument_name/playing_style.\n"
+            "- arrangement.role must be one of: percussion, bass, harmony, melody, fx.\n"
+            "- arrangement track keys must be unique within each section.\n"
+            "- role layer count must be decided contextually from concept/style/energy/section function, not fixed globally.\n"
+            "- low-energy or sparse sections can keep single-layer roles; high-energy dense sections can add more same-role layers.\n"
+            "- when using multiple tracks for one role, each track must have a distinct timbre or musical function.\n"
+            "- avoid over-layering: only add layers when they have clear arrangement value.\n"
+            "- transition_to_next must be concrete and practical for non-last sections.\n"
+            "- Keep output concise but specific; avoid placeholders.\n"
         )
 
-        combined_prompt = (
-            f"User Request: {user_request}\n\n"
-            f"### INSTRUCTIONS ###\n"
-            f"1. Output valid JSON strictly matching the schema below.\n"
-            f"2. Follow the Musicality Guidance provided.\n\n"
-            f"### JSON SCHEMA ###\n"
-            f"{schema_json}\n\n"
-            f"### GUIDELINES ###\n"
-            f"{musical_rules}"
+        prompt = (
+            f"User request:\n{user_request}\n\n"
+            f"Confirmed duration seconds: {float(user_confirmed_duration_sec):.2f}\n\n"
+            f"Concept input:\n{concept_json}\n\n"
+            "Generate a complete production-ready SongBlueprint.\n\n"
+            f"Compact output contract:\n{contract}\n\n"
+            f"{rules}"
         )
 
-        blueprint = self.call_llm(
-            user_prompt=combined_prompt,
+        return await self.call_llm_async(
+            user_prompt=prompt,
             response_model=SongBlueprint,
             temperature=0.3,
             max_tokens=1400,
         )
 
-        return blueprint
-
-    def generate_skeleton(self, user_request: str) -> SongBlueprintSkeleton:
-        schema_json = json.dumps(SongBlueprintSkeleton.model_json_schema(), indent=2)
-
-        rules = (
-            "RULES:\n"
-            "- Output ONLY valid JSON matching the schema.\n"
-            "- Sections must fully cover 1..total_bars without overlap.\n"
-            "- Must include a Drop section.\n"
-            "- Keep chord_progression short (2-4 chords).\n"
+    async def agenerate_blueprint(self, user_request: str) -> SongBlueprint:
+        """兼容入口：先生成 concept，再按默认时长生成 blueprint。"""
+        concept = await ConceptAgent().agenerate_concept(user_request)
+        duration = self._default_duration_from_concept(concept)
+        return await self.agenerate_blueprint_from_concept(
+            concept=concept,
+            user_request=user_request,
+            user_confirmed_duration_sec=duration,
         )
 
-        prompt = (
-            f"User Request: {user_request}\n\n"
-            f"### INSTRUCTIONS ###\n"
-            f"1. Output valid JSON strictly matching the schema below.\n"
-            f"2. Provide only coarse structure (no arrangement or phrases).\n\n"
-            f"### JSON SCHEMA ###\n"
-            f"{schema_json}\n\n"
-            f"### RULES ###\n"
-            f"{rules}"
+    # 旧接口显式弃用，防止上层误调用。
+    def generate_skeleton(self, user_request: str):
+        raise NotImplementedError(
+            "generate_skeleton is deprecated. Use generate_blueprint and LangGraph orchestration instead."
         )
 
-        skeleton = self.call_llm(
-            user_prompt=prompt,
-            response_model=SongBlueprintSkeleton,
-            temperature=0.3,
-            max_tokens=700,
+    # 旧接口显式弃用，防止上层误调用。
+    def enrich_section(self, *args, **kwargs):
+        raise NotImplementedError(
+            "enrich_section is deprecated. Use generate_blueprint and LangGraph orchestration instead."
         )
-        return skeleton
-
-    def enrich_section(
-        self,
-        skeleton: SongBlueprintSkeleton,
-        section_index: int,
-    ) -> Section:
-        if section_index < 0 or section_index >= len(skeleton.sections):
-            raise ValueError("section_index out of range.")
-        sec = skeleton.sections[section_index]
-
-        schema_json = json.dumps(Section.model_json_schema(), indent=2)
-        rules = (
-            "RULES:\n"
-            "- Output ONLY valid JSON matching the Section schema.\n"
-            "- Keep start_bar/end_bar/name consistent with the given section.\n"
-            "- Ensure section_len_bars == len(chord_progression) * bars_per_chord(chord_rhythm) * repeat when progression_is_loop.\n"
-            "- For short sections, reduce chord_rhythm or repeat to fit section length.\n"
-            "- Provide arrangement for at least drums and bass.\n"
-            "- If section_len_bars >= 16, phrases must fully cover the section.\n"
-        )
-
-        prompt = (
-            f"Skeleton Section:\n{sec.model_dump_json(indent=2)}\n\n"
-            f"Song Context:\n"
-            f"- bpm: {skeleton.bpm}\n"
-            f"- time_signature: {skeleton.time_signature}\n"
-            f"- key: {skeleton.root_note} {skeleton.scale}\n"
-            f"- style: {skeleton.style_description}\n\n"
-            f"### INSTRUCTIONS ###\n"
-            f"Fill in detailed fields for this section only.\n"
-            f"Output valid JSON matching the Section schema below.\n\n"
-            f"### JSON SCHEMA ###\n"
-            f"{schema_json}\n\n"
-            f"### RULES ###\n"
-            f"{rules}"
-        )
-
-        section_detail = self.call_llm(
-            user_prompt=prompt,
-            response_model=Section,
-            temperature=0.3,
-            max_tokens=900,
-        )
-        # Fallback: ensure phrases exist for Drop/Outro to avoid empty phrase plans downstream.
-        if section_detail.name in ("Drop", "Outro") and not section_detail.phrases:
-            section_detail.phrases = [
-                PhrasePlan(
-                    start_bar=section_detail.start_bar,
-                    end_bar=section_detail.end_bar,
-                    arrangement_override={},
-                )
-            ]
-        return section_detail

@@ -1,30 +1,41 @@
-# graph/state.py
-from typing import TypedDict, Optional, Dict, Any, List, Annotated
 import operator
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
+from schema.blueprint_schema import SongBlueprint
+from schema.concept import SongConcept
 
 
-# 定义一个辅助函数，用来合并字典，而不是覆盖
-def merge_dicts(a: Dict, b: Dict) -> Dict:
-    return {**a, **b}
+def merge_dicts(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    return {**(a or {}), **(b or {})}
 
-# 总定义
+
 class MusicState(TypedDict):
-    # 用户请求，字符串类型
+    # 运行唯一标识。MCP/LangGraph 都通过 run_id(thread_id) 做状态恢复与查询。
+    run_id: str
+    # 状态机阶段：
+    # concept_draft -> waiting_review -> blueprint_build -> section_generate -> done/failed
+    phase: str  # concept_draft|waiting_review|blueprint_build|section_generate|done|failed
+
+    # 用户原始需求。
     user_request: str
+    # concept 审核输入：
+    # {"approved": bool, "feedback": str|None}
+    concept_review: Optional[Dict[str, Any]]
+    # 用户确认时长（秒）。通过审核后进入 blueprint 计算时使用。
+    user_confirmed_duration_sec: Optional[float]
 
-    # 用 Dict 存 blueprint 数据
-    blueprint: Optional[Dict[str, Any]]
+    # 规划阶段产物：概念与总蓝图。
+    concept: Optional[SongConcept]
+    blueprint: Optional[SongBlueprint]
 
-    # 加上 Annotated 和 merge_dicts
-    # 这样 Drums 返回 {"drums":...}，Bass 返回 {"bass":...} 时
-    # LangGraph 会自动把它们拼在一起，而不是互相覆盖
+    # 生成阶段参数与产物。
+    # strictness: 生成保守度；tracks: 分段轨道结果；result_payload: 可观测统计信息。
+    strictness: int
     tracks: Annotated[Dict[str, Any], merge_dicts]
+    result_payload: Annotated[Dict[str, Any], merge_dicts]
 
-    # 显式存储关键信号，给下游 Bass/Chords 用，避免重复计算
-    kick_onsets: Optional[List[int]]
-    chord_progression: Optional[List[str]]
-
-    # 你的设计很好，保留用于 Critic
-    critique: Optional[Dict[str, Any]]
-    round: int
-    errors: Annotated[List[str], operator.add]  # 错误信息也建议用 append 模式
+    # 对外错误面：MCP/前端轮询时读取。
+    last_error: Optional[str]
+    last_error_code: Optional[str]
+    # 历史错误列表（reducer 追加），便于排查一次运行内的多条问题。
+    errors: Annotated[List[str], operator.add]

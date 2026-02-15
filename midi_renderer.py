@@ -1,4 +1,5 @@
-# midi_renderer.py
+"""MIDI 渲染器：将 TrackOut 列表写入标准 MIDI 文件。"""
+
 from mido import Message, MidiFile, MidiTrack, MetaMessage, bpm2tempo
 from track_builder import TrackOut
 
@@ -12,18 +13,18 @@ def render_tracks_to_midi(
     strictness: int = 1,
 ):
     """
-    Render TrackOut list to a MIDI file.
+    把 TrackOut 列表渲染为 MIDI 文件。
 
     Args:
-        tracks: Track list.
-        bpm: Tempo.
-        out_path: Output MIDI path.
-        strictness: Reserved for future use (0=creative, 1=balanced, 2=stable).
+        tracks: 轨道列表。
+        bpm: 速度（拍/分钟）。
+        out_path: 输出 MIDI 文件路径。
+        strictness: 预留参数（0=creative, 1=balanced, 2=stable）。
     """
     mid = MidiFile(type=1)
     mid.ticks_per_beat = TICKS_PER_BEAT
 
-    # global track
+    # 全局轨：写入速度等元信息。
     gt = MidiTrack()
     mid.tracks.append(gt)
     gt.append(MetaMessage("set_tempo", tempo=bpm2tempo(bpm), time=0))
@@ -35,7 +36,7 @@ def render_tracks_to_midi(
         mid.tracks.append(tr)
         tr.append(MetaMessage("track_name", name=t.name, time=0))
 
-        # collect note_on/off and sort by absolute tick
+        # 收集 note_on/note_off 事件，并按绝对 tick 排序。
         events = []
         for n in notes_to_render:
             events.append(("on", n.start_tick, n.pitch, n.velocity))
