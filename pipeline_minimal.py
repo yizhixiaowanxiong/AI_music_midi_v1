@@ -2,7 +2,8 @@ import asyncio
 import json
 from pathlib import Path
 
-from graph.adapter import LangGraphAdapter
+from graph.orchestrator import SongOrchestrator
+from utils.duration import default_duration_from_concept
 from midi_renderer import render_tracks_to_midi
 from schema.concept import SongConcept
 from track_builder import bass_to_track, drums_to_track
@@ -14,21 +15,18 @@ async def main():
         "with Intro 8, Build-up 8, Drop 16."
     )
 
-    adapter = LangGraphAdapter()
-
-    # 第一步：生成 concept，并停在审核门。
-    status = await adapter.start_run(user_request=user_request, strictness=1)
+    orchestrator = SongOrchestrator()
+    status = await orchestrator.start_run(user_request=user_request, strictness=1)
     run_id = status["run_id"]
     concept = SongConcept.model_validate(status.get("concept") or {})
-    duration = adapter.suggest_duration_sec(concept)
+    duration = default_duration_from_concept(concept)
 
-    # 第二步：用户确认 concept，流程继续到 blueprint + section 生成。
-    await adapter.submit_concept_review(
+    await orchestrator.submit_concept_review(
         approved=True,
         user_confirmed_duration_sec=duration,
         run_id=run_id,
     )
-    result = await adapter.get_run_result(run_id=run_id)
+    result = await orchestrator.get_run_result(run_id=run_id)
     if not result.get("ready"):
         raise RuntimeError(
             f"Run not ready. phase={result.get('phase')} error={result.get('last_error')}"

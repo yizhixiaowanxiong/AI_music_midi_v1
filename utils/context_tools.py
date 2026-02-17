@@ -5,14 +5,70 @@ from schema.arrangement import (
     GeneratedTrack,
     LastBarMidiSummary,
     LastBarTransitionNote,
+    PitchRange,
+    RhythmConstraint,
     TrackContext,
     TrackGenRequest,
 )
 from schema.base import AgentRoutingRole
 from summary.drum_summary import summarize_drums_for_bass
 from utils.constants import KICK_PITCHES
+from utils.context_summary import compose_context_summary, merge_context_summary
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_pitch_ranges(values: Any) -> List[PitchRange]:
+    out: List[PitchRange] = []
+    for item in list(values or []):
+        if isinstance(item, PitchRange):
+            out.append(item)
+            continue
+        if isinstance(item, dict):
+            try:
+                out.append(PitchRange(**item))
+            except Exception:
+                continue
+            continue
+        low = getattr(item, "low_midi", None)
+        high = getattr(item, "high_midi", None)
+        if low is None or high is None:
+            continue
+        try:
+            out.append(PitchRange(low_midi=int(low), high_midi=int(high)))
+        except Exception:
+            continue
+    return out
+
+
+def _normalize_rhythm_constraints(values: Any) -> List[RhythmConstraint]:
+    out: List[RhythmConstraint] = []
+    for item in list(values or []):
+        if isinstance(item, RhythmConstraint):
+            out.append(item)
+            continue
+        if isinstance(item, dict):
+            try:
+                out.append(RhythmConstraint(**item))
+            except Exception:
+                continue
+            continue
+        kind = getattr(item, "kind", None)
+        if not kind:
+            continue
+        anchor_ticks = getattr(item, "anchor_ticks", None) or []
+        payload = getattr(item, "payload", None) or {}
+        try:
+            out.append(
+                RhythmConstraint(
+                    kind=str(kind),
+                    anchor_ticks=[int(x) for x in list(anchor_ticks or [])],
+                    payload=dict(payload or {}),
+                )
+            )
+        except Exception:
+            continue
+    return out
 
 
 def inject_context_if_needed(req: TrackGenRequest, ctx: Optional[TrackContext]) -> TrackGenRequest:
@@ -33,12 +89,31 @@ def inject_context_if_needed(req: TrackGenRequest, ctx: Optional[TrackContext]) 
         req2.context = TrackContext()
 
     source = ctx.model_copy(deep=True) if hasattr(ctx, "model_copy") else TrackContext(**dict(ctx))
+    global_anchor_summary = str(getattr(req2, "global_anchor_summary", "") or "").strip()
+    section_summary = str(getattr(req2, "section_summary", "") or "").strip()
+    base_summary = compose_context_summary(
+        global_anchor_summary=global_anchor_summary,
+        section_summary=section_summary,
+    )
+    existing = str(getattr(req2, "context_summary", "") or "").strip()
+    if not base_summary:
+        base_summary = existing
+    elif existing and existing not in base_summary:
+        base_summary = f"{base_summary}\n{existing}"
+    req2.context_summary = merge_context_summary(base_summary, source)
+
+    req2.context.occupied_frequency_bands = list(source.occupied_frequency_bands or [])
+    req2.context.locked_rhythm_rules = list(source.locked_rhythm_rules or [])
+    req2.context.core_motif = source.core_motif
+    req2.context.occupied_pitch_ranges = _normalize_pitch_ranges(
+        getattr(source, "occupied_pitch_ranges", [])
+    )
+    req2.context.rhythm_constraints = _normalize_rhythm_constraints(
+        getattr(source, "rhythm_constraints", [])
+    )
 
     if role == AgentRoutingRole.BASS:
         req2.context.kick_onsets_ticks = list(source.kick_onsets_ticks or [])
-        req2.context.kick_summary_text = source.kick_summary_text
-        req2.context.break_ranges = source.break_ranges
-        req2.context.kick_pitches = list(source.kick_pitches or [])
     elif role == AgentRoutingRole.MELODY:
         req2.context.chord_notes_per_bar = [list(xs) for xs in (source.chord_notes_per_bar or [])]
         req2.context.prev_section_last_bar_midi = source.prev_section_last_bar_midi
@@ -85,11 +160,18 @@ def extract_kick_summary(track: GeneratedTrack) -> Optional[Dict[str, Any]]:
     if raw is not None:
         try:
             summary = summarize_drums_for_bass(raw, mode="min")
+            locked_rules: List[str] = []
+            break_ranges = str(summary.get("break_ranges") or "").strip()
+            if break_ranges:
+                locked_rules.append(f"Break windows: {break_ranges}")
+            kick_pitches = [int(x) for x in list(summary.get("kick_pitches") or [])]
+            if kick_pitches:
+                pitch_text = ",".join(str(p) for p in sorted(set(kick_pitches))[:8])
+                if pitch_text:
+                    locked_rules.append(f"Kick source pitches: {pitch_text}")
             return {
                 "kick_onsets_ticks": summary["kick_onsets_ticks"],
-                "kick_summary_text": summary["llm_context_text"],
-                "break_ranges": summary.get("break_ranges"),
-                "kick_pitches": summary.get("kick_pitches"),
+                "locked_rhythm_rules": locked_rules,
             }
         except Exception:
             logger.debug("summarize_drums_for_bass failed, fallback to note scan", exc_info=True)
@@ -119,8 +201,7 @@ def extract_kick_summary(track: GeneratedTrack) -> Optional[Dict[str, Any]]:
 
     return {
         "kick_onsets_ticks": kick_onsets,
-        "kick_summary_text": f"Kick count={len(kick_onsets)} (fallback)",
-        "kick_pitches": list(KICK_PITCHES),
+        "locked_rhythm_rules": ["Kick accents define rhythm anchor"],
     }
 
 
@@ -226,7 +307,12 @@ def extract_last_bar_midi(
 
     last_bar_start = int(sec_end - sec_start) * bar_ticks
     last_bar_end = last_bar_start + bar_ticks
-    grid = max(1, int(bar_ticks / (grid_div * 4)))  # grid_div=4 => 1/16 网格
+    try:
+        safe_grid_div = int(grid_div)
+    except Exception:
+        safe_grid_div = 4
+    safe_grid_div = max(1, safe_grid_div)
+    grid = max(1, int(bar_ticks / (safe_grid_div * 4)))  # safe_grid_div=4 => 1/16 grid
 
     notes = getattr(track, "notes", None)
     if not notes:

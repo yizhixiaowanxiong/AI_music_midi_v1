@@ -1,6 +1,6 @@
 from typing import List, Dict, Any, Set, Tuple, Optional, Iterable
 from utils.constants import KICK_PITCHES
-from schema.drum_schema import DrumsSectionOutput
+from schema.track_section_schema import DrumsSectionOutput
 from track_builder import flatten_section
 
 # ==========================================

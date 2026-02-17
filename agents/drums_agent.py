@@ -1,31 +1,47 @@
-# drums_agent.py
+"""Drums track generation agent."""
+
 from __future__ import annotations
 
-"""Drums Agent：负责鼓轨生成与后置稳定化规则。"""
-
-import copy
+import logging
 import json
-from typing import List
+import os
+from typing import List, Optional
 
 from pydantic import ValidationError
 
 from agents.musician_llm_agent import MusicianLlmAgent
 from schema.arrangement import GeneratedTrack, TrackGenRequest
 from schema.base import NoteEvent
-from schema.drum_schema import DrumsSectionOutput
+from schema.track_section_schema import DrumsSectionOutput
 from utils.constants import MIDI_CHANNEL_DRUMS, TPB
 from utils.json_tools import to_dict as _to_dict
 from utils.notes import to_note_events
+from utils.prompt_compact import (
+    compact_design,
+    compact_text,
+    section_output_contract,
+)
+from utils.context_budget import log_context_budget
 from utils.token_budget import get_section_max_tokens
 
-def _calc_bar_ticks(time_signature: str, tpb: int) -> int:
-    """按拍号与 TPB 计算每小节 tick。"""
-    n, d = time_signature.split("/")
-    return int(tpb * int(n) * (4 / int(d)))
+
+def _resolve_schema_retries(retries: Optional[int]) -> int:
+    if retries is not None:
+        return max(0, int(retries))
+    raw = str(os.getenv("MUSICIAN_SCHEMA_RETRIES", "")).strip()
+    if not raw:
+        return 1
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
+logger = logging.getLogger(__name__)
 
 
 class DrumsAgent(MusicianLlmAgent):
-    """鼓组生成 Agent。"""
+    """Generate drum patterns for one section."""
 
     def __init__(self):
         super().__init__(log_prefix="drums")
@@ -34,15 +50,11 @@ class DrumsAgent(MusicianLlmAgent):
         return to_note_events(out)
 
     async def generate(self, req: TrackGenRequest) -> GeneratedTrack:
-        """把统一调度请求转为鼓组段落生成，再回填为标准轨道输出。"""
-        design = getattr(req, "design", None)
-        design_payload = design.model_dump() if design is not None and hasattr(design, "model_dump") else (design or {})
-
+        design = req.design.model_dump() if hasattr(req.design, "model_dump") else (req.design or {})
         blueprint = {
             "bpm": req.bpm,
             "time_signature": req.time_signature,
             "style_description": req.style_description or "",
-            "groove_global": req.global_groove.model_dump() if req.global_groove else {},
         }
         section = {
             "name": req.section_name,
@@ -50,14 +62,34 @@ class DrumsAgent(MusicianLlmAgent):
             "end_bar": req.end_bar,
             "global_energy": req.energy_level if req.energy_level is not None else 0.6,
             "time_signature": req.time_signature,
-            "arrangement": {str(req.track_key or "drums"): design_payload},
+            "bar_ticks": req.bar_ticks,
+            "arrangement": {str(req.track_key or "drums"): design},
         }
+        ctx = req.context
+        avoidance_rule_text = ctx.to_rule_text() if ctx else ""
+        global_anchor_summary = str(getattr(req, "global_anchor_summary", "") or "")
+        section_summary = str(getattr(req, "section_summary", "") or "")
+        context_summary = str(getattr(req, "context_summary", "") or "")
+        context_budget = log_context_budget(
+            logger=logger,
+            agent="drums",
+            track_key=str(req.track_key or ""),
+            section_name=str(req.section_name or ""),
+            global_anchor_summary=global_anchor_summary,
+            section_summary=section_summary,
+            avoidance_rule_text=avoidance_rule_text,
+            context_summary=context_summary,
+        )
 
         drums_out = await self.generate_for_section(
             blueprint=blueprint,
             section=section,
             track_key=req.track_key,
             strictness=getattr(req, "strictness", 1),
+            global_anchor_summary=global_anchor_summary,
+            section_summary=section_summary,
+            context_summary=context_summary,
+            avoidance_rule_text=avoidance_rule_text,
         )
         return GeneratedTrack(
             track_key=req.track_key,
@@ -66,6 +98,7 @@ class DrumsAgent(MusicianLlmAgent):
             channel=int(req.midi_channel) if req.midi_channel is not None else MIDI_CHANNEL_DRUMS,
             notes=self._to_note_events(drums_out),
             raw_output=drums_out,
+            metrics={"context_budget": context_budget},
         )
 
     async def generate_for_section(
@@ -74,131 +107,110 @@ class DrumsAgent(MusicianLlmAgent):
         section,
         track_key: str = "drums",
         strictness: int = 1,
-        retries: int = 2,
+        retries: Optional[int] = None,
+        global_anchor_summary: str = "",
+        section_summary: str = "",
+        context_summary: str = "",
+        avoidance_rule_text: str = "",
     ) -> DrumsSectionOutput:
-        """为单段落生成鼓组 pattern/phrase 输出。"""
         blueprint = _to_dict(blueprint)
         section = _to_dict(section)
-        section_len = section["end_bar"] - section["start_bar"] + 1
 
+        section_len = int(section["end_bar"]) - int(section["start_bar"]) + 1
         arrangement = section.get("arrangement", {}) or {}
-        # 兼容任意 track_key 的鼓轨写法，不强依赖固定 key=drums。
-        drums_inst = arrangement.get("drums")
-        if not drums_inst and isinstance(arrangement, dict):
+
+        drums_design = arrangement.get("drums")
+        if not drums_design and isinstance(arrangement, dict):
             for _, design in arrangement.items():
                 if not isinstance(design, dict):
                     continue
                 role_name = str(design.get("role", "") or "").strip().lower()
-                if role_name in ("percussion", "drums"):
-                    drums_inst = design
+                if role_name in ("drum", "drums", "percussion"):
+                    drums_design = design
                     break
-        if not drums_inst and isinstance(arrangement, dict) and arrangement:
-            drums_inst = next(iter(arrangement.values()))
-        drums_inst = drums_inst or {}
+        if not drums_design and isinstance(arrangement, dict) and arrangement:
+            drums_design = next(iter(arrangement.values()))
+        drums_design = drums_design or {}
 
         time_signature = section.get("time_signature") or blueprint.get("time_signature") or "4/4"
-        bar_ticks = _calc_bar_ticks(time_signature, TPB)
+        bar_ticks = int(section.get("bar_ticks", 0) or 0)
+        if not bar_ticks:
+            n, d = str(time_signature).split("/")
+            bar_ticks = int(TPB * int(n) * (4 / int(d)))
 
         system = (
-            "You are a professional drum programmer.\n"
-            "Return JSON only.\n"
-            f"time_signature={time_signature}, ticks_per_beat={TPB}, bar_ticks={bar_ticks}.\n"
-            "Rules:\n"
-            "- pattern_len_bars must be one of 1,2,4,8.\n"
-            "- note.start_tick must be inside one pattern cycle.\n"
-            "- phrases must fully cover section bars without overlap.\n"
-            "- phrase tags must exist in patterns.\n"
-            "- Use GM core mapping: kick36 snare38 clap39 chh42 ohh46 ride51.\n"
-            "- Create core groove first; fill should be a variation of core, not from scratch.\n"
-            "- strictness 0/1/2 means creative/balanced/stable.\n"
+            "You are a professional electronic drums programmer. "
+            "Return exactly one valid JSON object. No markdown, no explanations. "
+            "Respect strictness (0=creative, 1=balanced, 2=stable). "
+            "Write a clear core groove first; fill must be derived from that groove."
         )
 
-        example = {
-            "track_key": track_key,
-            "section_name": section["name"],
-            "section_start_bar": section["start_bar"],
-            "section_end_bar": section["end_bar"],
-            "time_signature": time_signature,
-            "pattern_len_bars": 1,
-            "ticks_per_beat": TPB,
-            "bar_ticks": bar_ticks,
-            "patterns": [
-                {"tag": "core", "notes": [{"pitch": 36, "start_tick": 0, "duration_tick": 60, "velocity": 110}]},
-                {
-                    "tag": "fill",
-                    "notes": [{"pitch": 38, "start_tick": max(0, bar_ticks - 240), "duration_tick": 60, "velocity": 100}],
-                },
-            ],
-            "phrases": [
-                {
-                    "start_bar": section["start_bar"],
-                    "end_bar": section["end_bar"],
-                    "use_pattern_tag": "core",
-                    "end_fill_tag": "fill",
-                }
-            ],
-        }
-
-        user_payload = {
+        payload = {
+            "task": "generate_drums_section",
             "target_track": {
                 "track_key": track_key,
-                "role": "percussion",
-                "instrument_design": drums_inst,
+                "role": "drum",
+                "instrument_design": compact_design(drums_design),
             },
-            "strictness": strictness,
+            "strictness": int(strictness),
             "song": {
-                "bpm": blueprint.get("bpm"),
-                "time_signature": time_signature,
+                "bpm": int(blueprint.get("bpm") or 120),
+                "time_signature": str(time_signature),
                 "ticks_per_beat": TPB,
-                "bar_ticks": bar_ticks,
-                "groove_global": blueprint.get("groove_global", {}),
-                "style_description": blueprint.get("style_description", ""),
+                "bar_ticks": int(bar_ticks),
+                "style_description": compact_text(blueprint.get("style_description"), max_chars=160),
             },
             "section": {
-                "name": section["name"],
-                "start_bar": section["start_bar"],
-                "end_bar": section["end_bar"],
-                "len_bars": section_len,
-                "global_energy": section.get("global_energy", 0.5),
-                "drums_instruction": drums_inst,
+                "name": compact_text(section.get("name"), max_chars=48),
+                "start_bar": int(section["start_bar"]),
+                "end_bar": int(section["end_bar"]),
+                "len_bars": int(section_len),
+                "global_energy": float(section.get("global_energy", 0.6)),
             },
-            "example_shape": example,
+            "output_contract": section_output_contract(track_key),
         }
+        payload = self._inject_context_layer_payload(
+            payload,
+            global_anchor_summary=global_anchor_summary,
+            section_summary=section_summary,
+            avoidance_rule_text=avoidance_rule_text,
+            context_summary=context_summary,
+        )
 
-        prompt = json.dumps(user_payload, ensure_ascii=False)
-        last_err = None
-        for i in range(retries + 1):
+        prompt = json.dumps(payload, ensure_ascii=False)
+        attempts = _resolve_schema_retries(retries)
+        last_err: Exception | None = None
+
+        for i in range(attempts + 1):
             budget_tokens = get_section_max_tokens("drums", section_len, i)
             try:
                 data = await self._call_json(
                     system,
                     prompt,
                     max_tokens=budget_tokens,
-                    temperature=0.25 if i == 0 else 0.15,
+                    temperature=0.2 if i == 0 else 0.12,
+                    response_model=DrumsSectionOutput,
                 )
             except json.JSONDecodeError as exc:
-                # 结构正确但非合法 JSON 时，追加修复指令重试。
                 last_err = exc
-                fix_payload = copy.deepcopy(user_payload)
-                fix_payload["fix_instruction"] = (
-                    "Your previous output was not valid JSON. "
-                    "Return ONLY a single valid JSON object. "
-                    "Use double quotes, include all required commas, and no extra text."
+                retry_payload = dict(payload)
+                retry_payload["retry_hint"] = (
+                    "Previous output was invalid JSON. Return one complete JSON object only."
                 )
-                fix_payload["previous_json_error"] = str(exc)
-                prompt = json.dumps(fix_payload, ensure_ascii=False)
+                retry_payload["previous_json_error"] = str(exc)
+                prompt = json.dumps(retry_payload, ensure_ascii=False)
                 continue
 
             try:
-                output = DrumsSectionOutput(**data)
-                return output
+                return DrumsSectionOutput(**data)
             except ValidationError as exc:
                 last_err = exc
-                fix_payload = copy.deepcopy(user_payload)
-                fix_payload["fix_instruction"] = (
-                    "Fix ONLY invalid/missing fields. Keep all valid fields unchanged. Return FULL corrected JSON only."
+                retry_payload = dict(payload)
+                retry_payload["retry_hint"] = (
+                    "Previous output failed schema validation. Keep valid fields, fix invalid ones, "
+                    "and return full corrected JSON."
                 )
-                fix_payload["previous_validation_error"] = str(exc)[:600]
-                prompt = json.dumps(fix_payload, ensure_ascii=False)
+                retry_payload["previous_validation_error"] = str(exc)[:500]
+                prompt = json.dumps(retry_payload, ensure_ascii=False)
 
         raise RuntimeError(f"Validation failed after retries: {last_err}")

@@ -46,6 +46,7 @@ except Exception:  # pragma: no cover - local fallback when fastmcp is unavailab
 from blueprint_report import format_report
 from graph.orchestrator import get_orchestrator
 from midi_renderer import render_tracks_to_midi
+from observability.metrics_server import maybe_start_metrics_server
 from schema.base import AgentRoutingRole, NoteEvent
 from track_builder import TrackOut, bass_to_track, drums_to_track
 
@@ -262,8 +263,13 @@ async def generate_full_song(
     ctx: Context = None,
 ) -> dict:
     # 解析会话上下文并启动新的 run。
+    session_id = _resolve_session_id(ctx)
     session = _get_session(ctx)
-    status = await _ORCH.start_run(user_request=user_request, strictness=int(strictness))
+    status = await _ORCH.start_run(
+        user_request=user_request,
+        strictness=int(strictness),
+        session_id=session_id,
+    )
     session.last_run_id = status["run_id"]
     return status
 
@@ -494,4 +500,5 @@ async def current_blueprint(ctx: Context = None) -> str:
 
 
 if __name__ == "__main__":
+    maybe_start_metrics_server()
     mcp.run()

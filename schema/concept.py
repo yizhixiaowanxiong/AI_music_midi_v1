@@ -1,3 +1,8 @@
+﻿"""概念层（Concept）schema。
+
+概念层只描述音乐目标与结构意图，不直接产出音符。
+"""
+
 import re
 from typing import List
 
@@ -9,32 +14,31 @@ _TIME_SIGNATURE_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 
 
 class SectionConcept(BaseModel):
-    """概念段落：定义段落氛围与能量，不包含具体小节计算。"""
+    """概念段落：描述氛围与能量，不绑定具体小节排布。"""
 
-    name: str = Field(..., description="段落名称，如 Intro/Verse/Drop")
+    name: str = Field(..., description="段落名，例如 Intro / Verse / Drop")
     vibe: str = Field(..., description="段落氛围描述")
-    energy_curve: float = Field(..., ge=0.0, le=1.0, description="能量等级，范围 [0.0, 1.0]")
-    reference_tags: List[str] = Field(default_factory=list, description="风格参考标签")
+    energy_curve: float = Field(..., ge=0.0, le=1.0, description="能量值，范围 [0.0, 1.0]")
+    reference_tags: List[str] = Field(default_factory=list, description="参考风格标签")
 
 
 class SongConcept(BaseModel):
-    """歌曲概念：包含风格、速度、拍号、调式与结构草图。"""
+    """歌曲概念：风格、节拍、调式与结构草图。"""
 
     title: str
     style_description: str
-    bpm: int = Field(..., gt=0, description="建议速度，必须为正整数")
+    bpm: int = Field(..., gt=0, description="建议速度，必须 > 0")
     time_signature: str = Field(..., description="拍号，格式如 4/4、3/4、6/8")
 
     scale: ScaleDefinition
     global_groove: GrooveIntent
     structure_flow: List[SectionConcept]
-    suggested_duration_range: str = Field(..., description="建议时长范围，如 180s-240s")
+    suggested_duration_range: str = Field(..., description="建议时长范围，例如 180s-240s")
 
     @field_validator("time_signature")
     @classmethod
     def normalize_time_signature(cls, value: str) -> str:
-        raw = str(value or "")
-        match = _TIME_SIGNATURE_RE.match(raw)
+        match = _TIME_SIGNATURE_RE.match(str(value or ""))
         if not match:
             raise ValueError("time_signature must be in 'numerator/denominator' format")
 
@@ -50,6 +54,7 @@ class SongConcept(BaseModel):
     @field_validator("suggested_duration_range", mode="before")
     @classmethod
     def normalize_duration_range(cls, value):
+        """兼容 list/tuple 输入，统一收敛为字符串区间。"""
         if isinstance(value, (list, tuple)) and len(value) >= 2:
             return f"{value[0]}-{value[1]}"
         return str(value or "")
