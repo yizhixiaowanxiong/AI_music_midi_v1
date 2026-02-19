@@ -1,237 +1,183 @@
-"""Track scheduler: run musician agents concurrently with timeout protection."""
+"""轨道执行器：负责 Agent 加载、上下文兜底注入、并发与超时控制。"""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
+import importlib
+import logging
 import os
-import time
-from typing import Callable, Dict, Tuple
+from typing import Any, Dict, Mapping, Optional
 
-from agents.base_musician_agent import BaseMusicianAgent
-from agents.bass_agent import BassAgent
-from agents.drums_agent import DrumsAgent
-from agents.fx_agent import FxAgent
-from agents.harmony_agent import HarmonyAgent
-from agents.melody_agent import MelodyAgent
-from agents.musician_llm_agent import pop_musician_log_scope, push_musician_log_scope
-from observability.metrics import (
-    AGENT_CACHE_HIT_TOTAL,
-    AGENT_CACHE_MISS_TOTAL,
-    RUNNER_QUEUE_WAIT_GLOBAL_SECONDS,
-    RUNNER_QUEUE_WAIT_RUN_SECONDS,
-    TRACK_TIMEOUT_TOTAL,
-)
-from schema.arrangement import GeneratedTrack, TrackContext, TrackGenRequest
-from schema.base import AgentRoutingRole
-from utils.context_tools import inject_context_if_needed
+from schema.request import GeneratedTrack, TrackContext, TrackGenRequest
+from utils.context_tools import build_context_summary
+
+logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int, min_value: int, max_value: int) -> int:
+def _env_int(name: str, default: int, min_value: int = 1) -> int:
+    """读取环境变量并做最小值保护。"""
     raw = str(os.getenv(name, "")).strip()
     if not raw:
-        return default
+        return max(min_value, int(default))
     try:
         value = int(raw)
     except ValueError:
-        return default
-    return max(min_value, min(max_value, value))
-
-
-def _env_float(name: str, default: float, min_value: float) -> float:
-    raw = str(os.getenv(name, "")).strip()
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        return default
+        value = int(default)
     return max(min_value, value)
 
 
-def _env_choice(name: str, default: str, choices: tuple[str, ...]) -> str:
-    raw = str(os.getenv(name, "")).strip().lower()
-    if not raw:
-        return str(default).lower()
-    if raw in choices:
-        return raw
-    return str(default).lower()
+_CONCURRENCY = _env_int("TRACK_CONCURRENCY", 5, 1)
+_TIMEOUT_SEC = float(_env_int("TRACK_TIMEOUT_SEC", 120, 1))
+_SEM = asyncio.Semaphore(_CONCURRENCY)
 
-
-AGENT_FACTORY: Dict[AgentRoutingRole, Callable[[], BaseMusicianAgent]] = {
-    AgentRoutingRole.PERCUSSION: DrumsAgent,
-    AgentRoutingRole.BASS: BassAgent,
-    AgentRoutingRole.MELODY: MelodyAgent,
-    AgentRoutingRole.HARMONY: HarmonyAgent,
-    AgentRoutingRole.FX: FxAgent,
+AGENT_REGISTRY = {
+    "drums": ("agents.drums_agent", "DrumsAgent"),
+    "percussion": ("agents.drums_agent", "DrumsAgent"),
+    "bass": ("agents.bass_agent", "BassAgent"),
+    "melody": ("agents.melody_agent", "MelodyAgent"),
+    "harmony": ("agents.harmony_agent", "HarmonyAgent"),
+    "fx": ("agents.fx_agent", "FxAgent"),
 }
 
-_CONCURRENCY = _env_int("TRACK_CONCURRENCY", default=4, min_value=1, max_value=16)
-_SEM = asyncio.Semaphore(_CONCURRENCY)
-_RUN_CONCURRENCY = _env_int(
-    "TRACK_CONCURRENCY_PER_RUN",
-    default=_CONCURRENCY,
-    min_value=1,
-    max_value=16,
-)
-_AGENT_CACHE_SCOPE = _env_choice("AGENT_CACHE_SCOPE", default="run", choices=("run", "process"))
-_TRACK_TIMEOUT_SEC = _env_float("TRACK_TIMEOUT_SEC", default=90.0, min_value=0.0)
-_TRACK_TIMEOUT_SOFT_CAP_SEC = _env_float("TRACK_TIMEOUT_SOFT_CAP_SEC", default=90.0, min_value=0.0)
-if _TRACK_TIMEOUT_SOFT_CAP_SEC > 0:
-    _TRACK_TIMEOUT_SEC = min(_TRACK_TIMEOUT_SEC, _TRACK_TIMEOUT_SOFT_CAP_SEC)
-
-_PROCESS_SCOPE_ID = "__process__"
-
-# (scope_id, role) -> (factory, instance)
-_AGENT_CACHE: Dict[Tuple[str, AgentRoutingRole], Tuple[Callable[[], BaseMusicianAgent], BaseMusicianAgent]] = {}
-
-# scope_id -> semaphore
-_RUN_SCOPE_SEMAPHORES: Dict[str, asyncio.Semaphore] = {}
+_AGENT_CACHE: Dict[str, Any] = {}
 
 
-def _resolve_scope_id(run_scope_id: str | None) -> str:
-    text = str(run_scope_id or "").strip()
-    if _AGENT_CACHE_SCOPE == "run" and text:
-        return f"run:{text}"
-    return _PROCESS_SCOPE_ID
+def _normalize_role(role: Any) -> str:
+    """统一角色文本，兼容 percussion/drums 命名差异。"""
+    value = getattr(role, "value", role)
+    text = str(value or "").strip().lower()
+    if text == "percussion":
+        return "drums"
+    return text
 
 
-def _scope_label(scope_id: str) -> str:
-    if str(scope_id or "").startswith("run:"):
-        return "run"
-    return "process"
+def _cache_key(run_scope_id: str, role: str) -> str:
+    """构造运行期缓存键（按 run 作用域隔离）。"""
+    return f"{str(run_scope_id or 'default').strip()}:{str(role or '').strip()}"
 
 
-def _role_label(role: AgentRoutingRole | str | None) -> str:
-    if isinstance(role, AgentRoutingRole):
-        return role.value
-    return str(role or "unknown").strip().lower() or "unknown"
+def _get_agent_class(role: str):
+    """动态加载 Agent 类，失败返回 None。"""
+    role_key = _normalize_role(role)
+    if role_key not in AGENT_REGISTRY:
+        logger.warning("Unknown role '%s', no registered agent.", role)
+        return None
+
+    module_path, class_name = AGENT_REGISTRY[role_key]
+    try:
+        module = importlib.import_module(module_path)
+        return getattr(module, class_name)
+    except (ImportError, AttributeError) as exc:
+        logger.error("Failed to load agent for role '%s': %s", role_key, exc)
+        return None
 
 
-def _get_scope_semaphore(scope_id: str) -> asyncio.Semaphore:
-    sem = _RUN_SCOPE_SEMAPHORES.get(scope_id)
-    if sem is not None:
-        return sem
-    sem = asyncio.Semaphore(_RUN_CONCURRENCY)
-    _RUN_SCOPE_SEMAPHORES[scope_id] = sem
-    return sem
+def get_agent_instance(role: str, run_scope_id: str = "default"):
+    """获取（或创建）缓存 Agent 实例。"""
+    role_key = _normalize_role(role)
+    key = _cache_key(run_scope_id, role_key)
+    cached = _AGENT_CACHE.get(key)
+    if cached is not None:
+        return cached
 
+    cls = _get_agent_class(role_key)
+    if cls is None:
+        return None
 
-def _clear_agent_cache(scope_id: str | None = None) -> None:
-    """Clear cached agent instances (used by tests/reload paths)."""
-    if scope_id is None:
-        _AGENT_CACHE.clear()
-        _RUN_SCOPE_SEMAPHORES.clear()
-        return
-
-    keys = [key for key in _AGENT_CACHE.keys() if key[0] == scope_id]
-    for key in keys:
-        _AGENT_CACHE.pop(key, None)
-    _RUN_SCOPE_SEMAPHORES.pop(scope_id, None)
-
-
-def clear_run_runtime(run_scope_id: str | None) -> None:
-    """Clear per-run cached agent instances and semaphores."""
-    scope_id = _resolve_scope_id(run_scope_id)
-    _clear_agent_cache(scope_id=scope_id)
-
-
-def _get_or_create_agent(
-    scope_id: str,
-    role: AgentRoutingRole,
-    factory: Callable[[], BaseMusicianAgent],
-) -> BaseMusicianAgent:
-    scope = _scope_label(scope_id)
-    cache_key = (scope_id, role)
-    cached = _AGENT_CACHE.get(cache_key)
-    if cached and cached[0] is factory:
-        AGENT_CACHE_HIT_TOTAL.labels(scope=scope).inc()
-        return cached[1]
-
-    agent = factory()
-    _AGENT_CACHE[cache_key] = (factory, agent)
-    AGENT_CACHE_MISS_TOTAL.labels(scope=scope).inc()
+    agent = cls()
+    _AGENT_CACHE[key] = agent
     return agent
 
 
-async def _call_generate(agent: BaseMusicianAgent, req: TrackGenRequest) -> GeneratedTrack:
-    fn = getattr(agent, "generate", None)
-    if fn is None:
-        raise RuntimeError(f"{agent.__class__.__name__} missing async generate(req)")
+def clear_run_cache(run_scope_id: str) -> None:
+    """清理指定 run 作用域下的 Agent 缓存。"""
+    prefix = f"{str(run_scope_id or '').strip()}:"
+    keys = [k for k in _AGENT_CACHE.keys() if k.startswith(prefix)]
+    for key in keys:
+        _AGENT_CACHE.pop(key, None)
 
-    out = fn(req)
-    if not inspect.isawaitable(out):
-        raise RuntimeError(f"{agent.__class__.__name__}.generate must be async")
-    return await out
+
+def clear_run_runtime(run_scope_id: str | None) -> None:
+    """对齐 graph 侧命名的兼容接口。"""
+    clear_run_cache(str(run_scope_id or ""))
+
+
+def _context_to_prev_tracks(runtime_context: Any) -> Dict[str, Any]:
+    """仅当 runtime_context 是映射时，作为 prev_tracks 使用。"""
+    if isinstance(runtime_context, Mapping):
+        return dict(runtime_context)
+    return {}
+
+
+def _ensure_request_context(req: TrackGenRequest, runtime_context: Any) -> None:
+    """把 TrackContext 注入到 req.context（如果请求里尚未携带）。"""
+    if getattr(req, "context", None):
+        return
+    if isinstance(runtime_context, TrackContext):
+        req.context = runtime_context
 
 
 async def run_one_track(
     req: TrackGenRequest,
-    runtime_context: TrackContext,
+    runtime_context: Any = None,
     run_scope_id: str | None = None,
     session_scope_id: str | None = None,
+    run_id: str | None = None,
 ) -> GeneratedTrack:
-    scope_id = _resolve_scope_id(run_scope_id)
-    role = getattr(req, "instrument", None)
-    factory = AGENT_FACTORY.get(role)
-    if not factory:
-        return GeneratedTrack(
-            track_key=getattr(req, "track_key", "unknown"),
-            instrument=role,
-            section_name=getattr(req, "section_name", "Unknown"),
-            notes=[],
-            error=f"No agent found for role={role}",
-        )
+    """
+    运行单条轨道任务（兼容 graph 调用）：
+    1) 规范 role/instrument
+    2) 兜底注入 context_summary
+    3) 加载 Agent 并执行
+    """
+    _ = session_scope_id
+    scope = str(run_scope_id or run_id or "default")
 
-    req_injected = inject_context_if_needed(req, runtime_context)
-    track_key = getattr(req_injected, "track_key", "unknown")
+    role_value = getattr(req, "instrument", None) or getattr(req, "role", None)
+    role_name = _normalize_role(role_value)
+    if not role_name:
+        return _create_error_track(req, "missing role/instrument")
+
+    if not str(getattr(req, "role", "") or "").strip():
+        req.role = str(role_name)
+    if not str(getattr(req, "instrument", "") or "").strip():
+        req.instrument = str(role_name)
+
+    _ensure_request_context(req, runtime_context)
+    # 只有上游没注入时才做兜底摘要，避免重复计算与提示漂移。
+    if not str(getattr(req, "context_summary", "") or "").strip():
+        req.context_summary = build_context_summary(req, _context_to_prev_tracks(runtime_context))
+
+    agent = get_agent_instance(role_name, scope)
+    if agent is None:
+        return _create_error_track(req, f"No agent for role={role_name}")
 
     try:
-        agent = _get_or_create_agent(scope_id, role, factory)
-    except Exception as exc:
-        return GeneratedTrack(
-            track_key=track_key,
-            instrument=role,
-            section_name=getattr(req_injected, "section_name", "Unknown"),
-            notes=[],
-            error=f"Failed to create agent for role={role}: {exc}",
-        )
-
-    try:
-        log_tokens = push_musician_log_scope(
-            session_id=str(session_scope_id or ""),
-            run_id=str(run_scope_id or ""),
-            track_key=str(track_key),
-        )
-        global_wait_started = time.perf_counter()
         async with _SEM:
-            RUNNER_QUEUE_WAIT_GLOBAL_SECONDS.observe(max(0.0, time.perf_counter() - global_wait_started))
-            run_wait_started = time.perf_counter()
-            async with _get_scope_semaphore(scope_id):
-                RUNNER_QUEUE_WAIT_RUN_SECONDS.observe(max(0.0, time.perf_counter() - run_wait_started))
-                if _TRACK_TIMEOUT_SEC > 0:
-                    return await asyncio.wait_for(
-                        _call_generate(agent, req_injected),
-                        timeout=_TRACK_TIMEOUT_SEC,
-                    )
-                return await _call_generate(agent, req_injected)
+            logger.info("[%s] Start generating section %s...", role_name, req.section_index)
+            out = await asyncio.wait_for(agent.generate(req), timeout=_TIMEOUT_SEC)
+            if isinstance(out, GeneratedTrack):
+                return out
+            return GeneratedTrack(
+                track_key=str(getattr(req, "track_key", "") or "unknown"),
+                instrument=getattr(req, "instrument", role_name),
+                section_name=str(getattr(req, "section_name", "") or "Unknown"),
+                notes=[],
+                raw_output=out,
+            )
     except asyncio.TimeoutError:
-        TRACK_TIMEOUT_TOTAL.labels(role=_role_label(role)).inc()
-        return GeneratedTrack(
-            track_key=track_key,
-            instrument=role,
-            section_name=getattr(req_injected, "section_name", "Unknown"),
-            notes=[],
-            error=f"timeout after {_TRACK_TIMEOUT_SEC:.1f}s",
-        )
+        return _create_error_track(req, f"Timeout after {_TIMEOUT_SEC:.1f}s")
     except Exception as exc:
-        return GeneratedTrack(
-            track_key=track_key,
-            instrument=role,
-            section_name=getattr(req_injected, "section_name", "Unknown"),
-            notes=[],
-            error=str(exc),
-        )
-    finally:
-        if "log_tokens" in locals():
-            pop_musician_log_scope(log_tokens)
+        logger.exception("[%s] Runner failed: %s", role_name, exc)
+        return _create_error_track(req, str(exc))
+
+
+def _create_error_track(req: TrackGenRequest, error_msg: str) -> GeneratedTrack:
+    """统一错误兜底输出，保证上游流程不中断。"""
+    return GeneratedTrack(
+        track_key=str(getattr(req, "track_key", "") or "unknown"),
+        instrument=getattr(req, "instrument", "") or getattr(req, "role", "") or "unknown",
+        section_name=str(getattr(req, "section_name", "") or "Unknown"),
+        notes=[],
+        error=str(error_msg or "runner_error"),
+    )

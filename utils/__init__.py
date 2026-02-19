@@ -1,4 +1,4 @@
-"""utils 对外导出。"""
+"""utils 对外导出入口。"""
 
 from utils.dispatch import TrackDispatcher, dispatch_section_to_requests
 

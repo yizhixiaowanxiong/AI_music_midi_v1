@@ -116,6 +116,7 @@ class TrackOut:
     instrument: str
     channel: int
     notes: List[NoteEvent] = field(default_factory=list)
+    program: Optional[int] = None
 
 
 def drums_to_track(out: Any) -> TrackOut:

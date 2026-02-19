@@ -1,15 +1,15 @@
-"""MCP 服务入口：提供异步编排工具与资源查询接口。"""
+"""MCP service aligned with graph review gates and structured status APIs."""
 
 import asyncio
 import json
+import logging
+import re
 import sys
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
-from pathlib import Path
-import hashlib
-from typing import Any, Dict, List, Optional
 import uuid
+from datetime import datetime
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -17,13 +17,9 @@ if str(ROOT_DIR) not in sys.path:
 
 try:
     from fastmcp import Context, FastMCP
-    from fastmcp.server.dependencies import get_http_headers
 except Exception:  # pragma: no cover - local fallback when fastmcp is unavailable
     class Context:  # type: ignore
         session_id: Optional[str] = None
-
-    def get_http_headers(include_all: bool = True):  # type: ignore
-        return {}
 
     class FastMCP:  # type: ignore
         def __init__(self, name: str):
@@ -43,16 +39,22 @@ except Exception:  # pragma: no cover - local fallback when fastmcp is unavailab
         def run(self):
             raise RuntimeError("fastmcp is not installed in this environment.")
 
-from blueprint_report import format_report
-from graph.orchestrator import get_orchestrator
+from graph.state import MusicState
+from graph.workflow import music_app
 from midi_renderer import render_tracks_to_midi
-from observability.metrics_server import maybe_start_metrics_server
-from schema.base import AgentRoutingRole, NoteEvent
+from schema.request import GeneratedTrack
 from track_builder import TrackOut, bass_to_track, drums_to_track
 
+mcp = FastMCP("MusicGraph Agent")
+logger = logging.getLogger(__name__)
 
-mcp = FastMCP(name="AiAgentMusic MCP")
-_ORCH = get_orchestrator()
+_ACTION_ACCEPT = "accept"
+_ACTION_EDIT = "edit"
+_ACTION_REGENERATE = "regenerate"
+_ACTION_ABORT = "abort"
+
+_REVIEW_ACTIONS = {_ACTION_ACCEPT, _ACTION_EDIT, _ACTION_REGENERATE, _ACTION_ABORT}
+_LOCAL_SESSION_ID = f"local-{uuid.uuid4().hex}"
 
 
 @dataclass
@@ -62,109 +64,19 @@ class MusicSession:
 
 
 _SESSIONS: Dict[str, MusicSession] = {}
-_CTX_FALLBACK_SESSIONS: Dict[int, str] = {}
-_LOCAL_SESSION_ID = f"local-{uuid.uuid4().hex}"
-_REVIEW_TASKS: Dict[str, asyncio.Task] = {}
 
 
-def _resolve_session_id(ctx: Optional[Context]) -> str:
-    headers = get_http_headers(include_all=True) or {}
-    for key in ("session-id", "session_id", "mcp-session-id", "x-session-id"):
-        value = headers.get(key)
-        if value:
-            return value
-
-    # 当网关未显式透传 session-id 时，尽量使用请求指纹做弱稳定隔离，避免所有请求共享同一默认会话。
-    fp_parts = []
-    for key in ("x-forwarded-for", "x-real-ip", "user-agent"):
-        value = str(headers.get(key) or "").strip()
-        if value:
-            fp_parts.append(f"{key}={value}")
-    if fp_parts:
-        digest = hashlib.sha1("|".join(fp_parts).encode("utf-8")).hexdigest()[:16]
-        return f"anon-{digest}"
-
-    if ctx and getattr(ctx, "session_id", None):
-        return ctx.session_id
-
-    # 仍无可用标识时：按 Context 对象粒度分配回退会话；本地无 ctx 时使用进程级本地会话。
-    if ctx is not None:
-        key = id(ctx)
-        if key not in _CTX_FALLBACK_SESSIONS:
-            _CTX_FALLBACK_SESSIONS[key] = f"ctx-{uuid.uuid4().hex}"
-        return _CTX_FALLBACK_SESSIONS[key]
-    return _LOCAL_SESSION_ID
-
-
-def _get_session(ctx: Optional[Context]) -> MusicSession:
-    sid = _resolve_session_id(ctx)
-    if sid not in _SESSIONS:
-        _SESSIONS[sid] = MusicSession()
-    return _SESSIONS[sid]
-
-
-def _resolve_run_id(run_id: Optional[str], session: MusicSession) -> str:
-    # 优先使用显式 run_id；未传时回落到会话内最近一次 run。
-    rid = str(run_id or "").strip()
-    if rid:
-        session.last_run_id = rid
-        return rid
-    if session.last_run_id:
-        return session.last_run_id
-    raise ValueError("No run_id available. Call generate_full_song first.")
-
-
-def _is_review_task_running(run_id: str) -> bool:
-    task = _REVIEW_TASKS.get(run_id)
-    if task is None:
-        return False
-    if task.done():
-        _REVIEW_TASKS.pop(run_id, None)
-        return False
-    return True
-
-
-def _start_review_task(
-    run_id: str,
-    approved: bool,
-    feedback: Optional[str],
-    user_confirmed_duration_sec: Optional[float],
-    concept_updates: Optional[Dict[str, Any]],
-) -> bool:
-    if _is_review_task_running(run_id):
-        return False
-
-    async def _runner() -> None:
-        try:
-            await _ORCH.submit_concept_review(
-                run_id=run_id,
-                approved=bool(approved),
-                feedback=feedback,
-                user_confirmed_duration_sec=user_confirmed_duration_sec,
-                concept_updates=concept_updates,
-            )
-        finally:
-            _REVIEW_TASKS.pop(run_id, None)
-
-    task = asyncio.create_task(_runner(), name=f"review-{run_id[:8]}")
-
-    def _consume_result(done_task: asyncio.Task) -> None:
-        try:
-            done_task.result()
-        except BaseException:
-            # Errors are persisted into orchestrator state; avoid unhandled-task noise.
-            pass
-
-    task.add_done_callback(_consume_result)
-    _REVIEW_TASKS[run_id] = task
-    return True
+def _ensure_app() -> None:
+    if music_app is None:
+        raise RuntimeError("music_app is not available. Ensure langgraph is installed.")
 
 
 def _dump_value(value: Any) -> Any:
-    if isinstance(value, Enum):
-        return value.value
     if hasattr(value, "model_dump"):
-        return _dump_value(value.model_dump())
+        try:
+            return _dump_value(value.model_dump())
+        except Exception:
+            return value
     if isinstance(value, dict):
         return {k: _dump_value(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -172,87 +84,324 @@ def _dump_value(value: Any) -> Any:
     return value
 
 
-async def _require_ready_result(run_id: str) -> Dict[str, Any]:
-    # 需要最终结果的工具统一做 ready 校验。
-    result = await _ORCH.get_run_result(run_id)
-    if not result.get("ready"):
-        raise ValueError(
-            f"result_not_ready: run={run_id} phase={result.get('phase')!r}"
-        )
-    return result
+def _session_id(ctx: Optional[Context]) -> str:
+    raw = str(getattr(ctx, "session_id", "") or "").strip()
+    if raw:
+        return raw
+    return _LOCAL_SESSION_ID
 
 
-def _section_key_from_result(result: Dict[str, Any], section_index: int) -> str:
-    blueprint = result.get("blueprint") or {}
-    sections = blueprint.get("sections") or []
-    if section_index < 0 or section_index >= len(sections):
-        raise ValueError("section_index out of range.")
-    section = sections[section_index]
-    section_name = str(section.get("name") or "")
-    tracks = result.get("tracks") or {}
-
-    # 首选运行时索引（与 graph.nodes._section_key 保持一致）。
-    runtime_key = f"{section_index}:{section_name}"
-    if runtime_key in tracks:
-        return runtime_key
-
-    # 兼容旧数据：若 tracks 仍按 blueprint.section.index 编码，则回退该 key。
-    declared_idx = section.get("index")
-    if isinstance(declared_idx, int):
-        legacy_key = f"{declared_idx}:{section_name}"
-        if legacy_key in tracks:
-            return legacy_key
-
-    # 最后尝试按 section 名称唯一匹配。
-    suffix = f":{section_name}"
-    matches = [k for k in tracks.keys() if str(k).endswith(suffix)]
-    if len(matches) == 1:
-        return str(matches[0])
-    return runtime_key
+def _get_session(ctx: Optional[Context]) -> MusicSession:
+    sid = _session_id(ctx)
+    if sid not in _SESSIONS:
+        _SESSIONS[sid] = MusicSession()
+    return _SESSIONS[sid]
 
 
-def _normalize_instrument(value: Any) -> str:
-    if isinstance(value, Enum):
-        return str(value.value)
-    text = str(value or "")
-    return text.lower()
+def _resolve_run_id(run_id: Optional[str], session: MusicSession) -> str:
+    rid = str(run_id or "").strip()
+    if rid:
+        session.last_run_id = rid
+        return rid
+    if session.last_run_id:
+        return session.last_run_id
+    raise ValueError("No run_id available. Call start_new_song or generate_full_song first.")
 
 
-def _select_track_payload(
-    result: Dict[str, Any],
-    section_index: int,
-    role: AgentRoutingRole,
-) -> Dict[str, Any]:
-    section_key = _section_key_from_result(result, section_index)
-    tracks = (result.get("tracks") or {}).get(section_key, [])
-    target = role.value
-    for track in tracks:
-        if _normalize_instrument(track.get("instrument")) == target:
-            return track
-    raise ValueError(f"No {target} track found for section_index={section_index}.")
+def _config_for_run(run_id: str) -> Dict[str, Dict[str, str]]:
+    return {"configurable": {"thread_id": str(run_id)}}
 
 
-def _track_payload_to_midi_track(track: Dict[str, Any]) -> Optional[TrackOut]:
-    instrument = _normalize_instrument(track.get("instrument"))
-    raw = track.get("raw_output")
+async def _get_state(run_id: str) -> MusicState:
+    """异步获取当前 Graph 的快照状态"""
+    _ensure_app()
+    # 使用 aget_state 替代 get_state
+    snapshot = await music_app.aget_state(_config_for_run(run_id))
+    values = getattr(snapshot, "values", None)
+    if not isinstance(values, dict):
+        return {}
+    return values
 
-    if raw is not None:
-        if instrument in ("percussion", "drums"):
-            return drums_to_track(raw)
-        if instrument == "bass":
-            return bass_to_track(raw)
+async def _update_state(run_id: str, values: Dict[str, Any]):
+    """异步更新状态"""
+    _ensure_app()
+    # 使用 aupdate_state 替代 update_state
+    await music_app.aupdate_state(_config_for_run(run_id), values)
 
-    if instrument not in ("percussion", "drums", "bass"):
+
+# ---------------------------------------------------------------------------
+# Background graph execution (fire-and-forget, survives MCP cancellation)
+# ---------------------------------------------------------------------------
+
+_BG_TASKS: Dict[str, asyncio.Task] = {}
+
+
+async def _bg_invoke(run_id: str) -> None:
+    """Run ainvoke in the background; log errors but never propagate."""
+    try:
+        await music_app.ainvoke(None, _config_for_run(run_id))
+    except asyncio.CancelledError:
+        logger.warning("Background invoke for run %s was cancelled.", run_id)
+    except Exception as exc:
+        logger.exception("Background invoke for run %s failed: %s", run_id, exc)
+        # Best-effort: mark state as failed so polling can see it
+        try:
+            await _update_state(run_id, {"error": str(exc), "current_phase": "failed"})
+        except Exception:
+            pass
+    finally:
+        _BG_TASKS.pop(run_id, None)
+
+
+def _start_bg_invoke(run_id: str) -> None:
+    """Fire-and-forget graph execution that won't be cancelled by MCP timeout."""
+    old = _BG_TASKS.pop(run_id, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _BG_TASKS[run_id] = asyncio.create_task(_bg_invoke(run_id))
+
+
+def _phase(state: MusicState) -> str:
+    return str(state.get("current_phase", "")).strip() or "unknown"
+
+
+def _pending(state: MusicState) -> Optional[str]:
+    raw = state.get("pending_user_action")
+    text = str(raw or "").strip()
+    return text or None
+
+
+_PENDING_ACTION_INSTRUCTIONS = {
+    "concept_review": (
+        "STOP: You MUST present the concept to the user and WAIT for their explicit decision. "
+        "Ask the user whether to: accept (proceed to blueprint), edit (revise with feedback), "
+        "regenerate (start over), or abort. Do NOT call review_concept until the user responds."
+    ),
+    "blueprint_review": (
+        "STOP: You MUST present the blueprint to the user and WAIT for their explicit decision. "
+        "Ask the user whether to: accept (proceed to track generation), edit (revise with feedback), "
+        "regenerate (start over), or abort. Do NOT call review_blueprint until the user responds."
+    ),
+}
+
+
+def _normalize_status(run_id: str, state: MusicState, *, message: str = "") -> Dict[str, Any]:
+    phase = _phase(state)
+    pending = _pending(state)
+    error = _dump_value(state.get("error"))
+    tracks = state.get("tracks") or {}
+
+    # 当存在待用户操作时，强制附加交互指令
+    final_message = str(message or "")
+    if pending and pending in _PENDING_ACTION_INSTRUCTIONS:
+        final_message = _PENDING_ACTION_INSTRUCTIONS[pending]
+
+    out: Dict[str, Any] = {
+        "ok": error is None,
+        "run_id": str(run_id),
+        "phase": phase,
+        "pending_user_action": pending,
+        "ready": phase == "done",
+        "error": error,
+        "track_count": len(tracks),
+        "message": final_message,
+    }
+
+    # Map internal phases to a non-ready producing status
+    if phase in ("quality_check", "track_retry", "production_build"):
+        out["ready"] = False
+        out["phase"] = "producing"
+    if "concept_summary_short" in state:
+        out["concept_summary_short"] = _dump_value(state.get("concept_summary_short"))
+    if "blueprint_summary_short" in state:
+        out["blueprint_summary_short"] = _dump_value(state.get("blueprint_summary_short"))
+    return out
+
+
+def _normalize_action(action: str) -> str:
+    text = str(action or "").strip().lower()
+    if text in _REVIEW_ACTIONS:
+        return text
+    if text in ("approve", "approved", "ok", "yes"):
+        return _ACTION_ACCEPT
+    if text in ("revise", "update"):
+        return _ACTION_EDIT
+    if text in ("redo", "regen", "rerun"):
+        return _ACTION_REGENERATE
+    if text in ("stop", "cancel"):
+        return _ACTION_ABORT
+    return ""
+
+
+def _review_update_payload(target: str, action: str, feedback: str) -> Dict[str, Any]:
+    approved = action == _ACTION_ACCEPT
+    payload = {
+        target: {
+            "approved": approved,
+            "action": action,
+            "feedback": feedback or None,
+        },
+        # Legacy compatibility fields are still consumed by graph.nodes.
+        "user_action": action,
+        "user_feedback": feedback or None,
+    }
+    return payload
+
+
+def _normalize_role(value: Any) -> str:
+    role = str(getattr(value, "value", value) or "").strip().lower()
+    if role == "drums":
+        return "percussion"
+    return role
+
+
+def _section_index_from_track_key(track_key: str) -> Optional[int]:
+    match = re.match(r"^s(\d+)_", str(track_key or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
         return None
 
-    notes = [NoteEvent.model_validate(n) for n in (track.get("notes") or [])]
-    channel = 9 if instrument in ("percussion", "drums") else 1
+
+def _to_generated_track(raw: Any, fallback_key: str) -> Optional[GeneratedTrack]:
+    if isinstance(raw, GeneratedTrack):
+        return raw
+    if isinstance(raw, dict):
+        data = dict(raw)
+        if not data.get("track_key"):
+            data["track_key"] = str(fallback_key or "unknown")
+        if not data.get("section_name"):
+            data["section_name"] = "Section"
+        if not data.get("instrument"):
+            data["instrument"] = "melody"
+        try:
+            track = GeneratedTrack.model_validate(data)
+        except Exception:
+            return None
+        track.instrument = _normalize_role(track.instrument)
+        return track
+    return None
+
+
+def _channel_for_role(role: str) -> int:
+    if role == "percussion":
+        return 9
+    if role == "bass":
+        return 1
+    if role == "harmony":
+        return 2
+    if role == "melody":
+        return 3
+    if role == "fx":
+        return 4
+    return 0
+
+
+_GM_PROGRAM = {
+    "bass": 33,        # Electric Bass (Finger)
+    "melody": 0,       # Acoustic Grand Piano
+    "harmony": 48,     # String Ensemble
+    "fx": 122,         # Seashore
+    "percussion": None, # drums 不需要 program change
+}
+
+
+def _to_track_out(track: GeneratedTrack) -> Optional[TrackOut]:
+    role = _normalize_role(track.instrument)
+    raw = track.raw_output
+
+    if raw is not None:
+        if role == "percussion":
+            try:
+                return drums_to_track(raw)
+            except Exception:
+                pass
+        if role == "bass":
+            try:
+                return bass_to_track(raw)
+            except Exception:
+                pass
+
+    notes = list(track.notes or [])
+    if not notes:
+        return None
+
     return TrackOut(
-        name=f"{track.get('section_name', 'section')}_{instrument}",
-        instrument="drums" if channel == 9 else "bass",
-        channel=channel,
+        name=f"{track.section_name}_{role or 'track'}",
+        instrument=role or "unknown",
+        channel=_channel_for_role(role),
         notes=notes,
+        program=_GM_PROGRAM.get(role),
     )
+
+
+def _collect_tracks_for_export(
+    state: MusicState,
+    *,
+    section_index: Optional[int] = None,
+) -> List[GeneratedTrack]:
+    tracks = state.get("tracks") or {}
+    out: List[GeneratedTrack] = []
+    for key, value in tracks.items():
+        idx = _section_index_from_track_key(str(key))
+        if section_index is not None and idx is not None and idx != int(section_index):
+            continue
+        track = _to_generated_track(value, fallback_key=str(key))
+        if track is None:
+            continue
+        out.append(track)
+    return out
+
+
+async def _start_new_song_impl(
+    user_prompt: str,
+    strictness: int = 1,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Core implementation shared by start_new_song and generate_full_song."""
+    _ensure_app()
+    session = _get_session(ctx)
+    run_id = uuid.uuid4().hex[:12]
+
+    initial_state: Dict[str, Any] = {
+        "run_id": run_id,
+        "session_id": _session_id(ctx),
+        "user_request": str(user_prompt or ""),
+        "strictness": int(strictness),
+        "tracks": {},
+        "current_phase": "init",
+        "concept_review": {},
+        "blueprint_review": {},
+        "pending_user_action": None,
+        "user_action": None,
+        "user_feedback": None,
+    }
+
+    await music_app.ainvoke(initial_state, _config_for_run(run_id))
+    session.last_run_id = run_id
+    state = await _get_state(run_id)
+    status = _normalize_status(run_id, state, message="run started")
+    concept = _dump_value(state.get("concept"))
+    if concept is not None:
+        status["concept"] = concept
+    return status
+
+
+@mcp.tool
+async def start_new_song(
+    user_prompt: str,
+    strictness: int = 1,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Start a new song run. Returns a concept for user review.
+
+    IMPORTANT: After calling this tool, you MUST present the generated concept
+    to the user and WAIT for their explicit decision before calling review_concept.
+    Do NOT automatically accept or proceed. The user must choose: accept / edit / regenerate / abort.
+    """
+    return await _start_new_song_impl(user_prompt=user_prompt, strictness=int(strictness), ctx=ctx)
 
 
 @mcp.tool
@@ -261,244 +410,245 @@ async def generate_full_song(
     strictness: int = 1,
     task_progress: Optional[str] = None,
     ctx: Context = None,
-) -> dict:
-    # 解析会话上下文并启动新的 run。
-    session_id = _resolve_session_id(ctx)
-    session = _get_session(ctx)
-    status = await _ORCH.start_run(
-        user_request=user_request,
-        strictness=int(strictness),
-        session_id=session_id,
-    )
-    session.last_run_id = status["run_id"]
-    return status
+) -> Dict[str, Any]:
+    """Start a new song run (alias for start_new_song). Returns a concept for user review.
+
+    IMPORTANT: After calling this tool, you MUST present the generated concept
+    to the user and WAIT for their explicit decision before calling review_concept.
+    Do NOT automatically accept or proceed. The user must choose: accept / edit / regenerate / abort.
+    """
+    _ = task_progress
+    return await _start_new_song_impl(user_prompt=user_request, strictness=int(strictness), ctx=ctx)
 
 
 @mcp.tool
 async def review_concept(
-    approved: bool,
-    feedback: Optional[str] = None,
-    user_confirmed_duration_sec: Optional[float] = None,
-    concept_updates: Optional[Dict[str, Any]] = None,
-    background: bool = True,
+    action: Literal["accept", "edit", "regenerate", "abort"],
+    feedback: str = "",
     run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
     ctx: Context = None,
-) -> dict:
-    # 在会话范围内提交 concept 审核并推进流程。
+) -> Dict[str, Any]:
+    """Submit the user's concept review decision and resume graph execution.
+
+    IMPORTANT: Only call this tool AFTER the user has explicitly chosen an action.
+    Never call this automatically. The action parameter must reflect the user's actual choice.
+    If action is 'edit' or 'regenerate', include the user's feedback.
+    """
+    _ensure_app()
     session = _get_session(ctx)
     rid = _resolve_run_id(run_id, session)
-    if not background:
-        status = await _ORCH.submit_concept_review(
-            run_id=rid,
-            approved=bool(approved),
-            feedback=feedback,
-            user_confirmed_duration_sec=user_confirmed_duration_sec,
-            concept_updates=concept_updates,
-        )
-        status["review_task_running"] = _is_review_task_running(rid)
-        session.last_run_id = rid
+    state = await _get_state(rid)
+    status = _normalize_status(rid, state)
+
+    if status.get("pending_user_action") != "concept_review":
+        status["ok"] = False
+        status["message"] = f"phase_mismatch: pending={status.get('pending_user_action')!r}, phase={status.get('phase')!r}"
         return status
 
-    feedback_text = str(feedback or "").strip()
-    if concept_updates is not None and not isinstance(concept_updates, dict):
-        raise ValueError("concept_updates must be an object.")
-    if not approved and not feedback_text and not concept_updates:
-        raise ValueError("feedback is required when approved=False.")
-    if user_confirmed_duration_sec is not None and float(user_confirmed_duration_sec) <= 0:
-        raise ValueError("user_confirmed_duration_sec must be > 0.")
+    normalized = _normalize_action(action)
+    if not normalized:
+        return {
+            **status,
+            "ok": False,
+            "message": f"invalid_action:{action}",
+        }
+    payload = _review_update_payload("concept_review", normalized, str(feedback or "").strip())
+    config = _config_for_run(rid)
+    await music_app.aupdate_state(config, payload)
 
-    status = await _ORCH.get_run_status(rid)
-    phase = str(status.get("phase") or "")
+    # For non-accept actions the graph pauses quickly (at next review gate),
+    # so synchronous await is fine.  For accept the downstream nodes
+    # (blueprint generation) are fast enough to await inline.
+    await music_app.ainvoke(None, config)
 
-    if phase in ("done", "failed"):
-        status["review_task_running"] = _is_review_task_running(rid)
-        session.last_run_id = rid
-        return status
-
-    if phase != "waiting_review":
-        status["accepted"] = False
-        status["review_task_running"] = _is_review_task_running(rid)
-        status["message"] = f"run is busy in phase={phase!r}, skip duplicate review submit."
-        session.last_run_id = rid
-        return status
-
-    accepted = _start_review_task(
-        run_id=rid,
-        approved=bool(approved),
-        feedback=feedback_text or None,
-        user_confirmed_duration_sec=user_confirmed_duration_sec,
-        concept_updates=concept_updates,
-    )
-    status["accepted"] = bool(accepted)
-    status["review_task_running"] = _is_review_task_running(rid)
-    if accepted:
-        status["phase"] = "blueprint_build" if approved else "concept_draft"
-        status["ready"] = False
-        status["message"] = "review accepted; generation is running in background."
-    else:
-        status["message"] = "review task already running for this run_id."
+    next_state = await _get_state(rid)
     session.last_run_id = rid
-    return status
+    return _normalize_status(rid, next_state, message="concept review applied")
+
+
+@mcp.tool
+async def review_blueprint(
+    action: Literal["accept", "edit", "regenerate", "abort"],
+    feedback: str = "",
+    run_id: Optional[str] = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """Submit the user's blueprint review decision and resume graph execution.
+
+    IMPORTANT: Only call this tool AFTER the user has explicitly chosen an action.
+    Never call this automatically. The action parameter must reflect the user's actual choice.
+    If action is 'edit' or 'regenerate', include the user's feedback.
+    """
+    _ensure_app()
+    session = _get_session(ctx)
+    rid = _resolve_run_id(run_id, session)
+    state = await _get_state(rid)
+    status = _normalize_status(rid, state)
+
+    if status.get("pending_user_action") != "blueprint_review":
+        status["ok"] = False
+        status["message"] = f"phase_mismatch: pending={status.get('pending_user_action')!r}, phase={status.get('phase')!r}"
+        return status
+
+    normalized = _normalize_action(action)
+    if not normalized:
+        return {
+            **status,
+            "ok": False,
+            "message": f"invalid_action:{action}",
+        }
+    payload = _review_update_payload("blueprint_review", normalized, str(feedback or "").strip())
+    config = _config_for_run(rid)
+    await music_app.aupdate_state(config, payload)
+
+    if normalized == _ACTION_ACCEPT:
+        # Track generation (compose_music + quality_gate + retries) is long-running.
+        # Run graph in background so MCP timeout won't kill it.
+        _start_bg_invoke(rid)
+        session.last_run_id = rid
+        state_now = await _get_state(rid)
+        return _normalize_status(rid, state_now, message="blueprint accepted, track generation started in background. Poll get_song_status to check progress.")
+    else:
+        # edit / regenerate / abort finish quickly (next interrupt is nearby)
+        await music_app.ainvoke(None, config)
+        next_state = await _get_state(rid)
+        session.last_run_id = rid
+        return _normalize_status(rid, next_state, message="blueprint review applied")
 
 
 @mcp.tool
 async def get_song_status(
     run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
     ctx: Context = None,
-) -> dict:
-    # 轻量状态查询，适合轮询。
+) -> Dict[str, Any]:
+    """Read normalized status for the current run."""
     session = _get_session(ctx)
     rid = _resolve_run_id(run_id, session)
-    status = await _ORCH.get_run_status(rid)
-    status["review_task_running"] = _is_review_task_running(rid)
-    return status
+    state = await _get_state(rid)
+    session.last_run_id = rid
+    return _normalize_status(rid, state, message="status")
 
 
 @mcp.tool
 async def get_song_result(
     run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
     ctx: Context = None,
-) -> dict:
-    # 最终结果查询；未完成时返回 ready=False。
+) -> Dict[str, Any]:
+    """Read full run payload (concept/blueprint/tracks) when available."""
     session = _get_session(ctx)
     rid = _resolve_run_id(run_id, session)
-    result = await _ORCH.get_run_result(rid)
-    result["review_task_running"] = _is_review_task_running(rid)
-    return result
+    state = await _get_state(rid)
+    status = _normalize_status(rid, state, message="result")
+    status["concept"] = _dump_value(state.get("concept"))
+    status["blueprint"] = _dump_value(state.get("blueprint"))
+    status["tracks"] = _dump_value(state.get("tracks") or {})
+    session.last_run_id = rid
+    return status
 
 
-@mcp.tool
-async def enrich_section_details(
-    section_index: int,
-    run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
-    ctx: Context = None,
-) -> dict:
-    session = _get_session(ctx)
-    rid = _resolve_run_id(run_id, session)
-    result = await _require_ready_result(rid)
-    blueprint = result.get("blueprint") or {}
-    sections = blueprint.get("sections") or []
-    if section_index < 0 or section_index >= len(sections):
-        raise ValueError("section_index out of range.")
-    session.last_section_index = section_index
-    return sections[section_index]
-
-
-@mcp.tool
-async def generate_drums(
-    section_index: int,
-    run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
-    ctx: Context = None,
-) -> dict:
-    session = _get_session(ctx)
-    rid = _resolve_run_id(run_id, session)
-    result = await _require_ready_result(rid)
-    track = _select_track_payload(result, section_index, AgentRoutingRole.PERCUSSION)
-    session.last_section_index = section_index
-    return dict(track)
-
-
-@mcp.tool
-async def generate_bass(
-    section_index: int,
-    run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
-    ctx: Context = None,
-) -> dict:
-    session = _get_session(ctx)
-    rid = _resolve_run_id(run_id, session)
-    result = await _require_ready_result(rid)
-    track = _select_track_payload(result, section_index, AgentRoutingRole.BASS)
-    session.last_section_index = section_index
-    return dict(track)
+def _build_midi_filename(concept: Dict[str, Any]) -> str:
+    """从 concept 中提取风格描述作为文件名，加上日期时间后缀。"""
+    raw_name = str(concept.get("style_description") or concept.get("mood") or "untitled").strip()
+    # 只保留字母、数字、中文、空格、连字符
+    sanitized = re.sub(r"[^\w\s\u4e00-\u9fff-]", "", raw_name)
+    # 空格/连续空白替换为下划线
+    sanitized = re.sub(r"\s+", "_", sanitized.strip())
+    # 限制长度
+    if len(sanitized) > 60:
+        sanitized = sanitized[:60]
+    if not sanitized:
+        sanitized = "untitled"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{sanitized}_{timestamp}.mid"
 
 
 @mcp.tool
 async def export_midi(
+    filename: str = "output.mid",
     section_index: Optional[int] = None,
-    out_filename: Optional[str] = None,
     run_id: Optional[str] = None,
-    task_progress: Optional[str] = None,
     ctx: Context = None,
-) -> dict:
+) -> Dict[str, Any]:
+    """Export generated tracks to a MIDI file."""
     session = _get_session(ctx)
     rid = _resolve_run_id(run_id, session)
-    result = await _require_ready_result(rid)
-    blueprint = result.get("blueprint") or {}
-    sections = blueprint.get("sections") or []
+    state = await _get_state(rid)
+    phase = _phase(state)
+    if phase != "done":
+        return {
+            "ok": False,
+            "run_id": rid,
+            "phase": phase,
+            "ready": False,
+            "error": "result_not_ready",
+            "message": "Run is not finished yet.",
+        }
 
-    if section_index is None:
-        section_index = session.last_section_index if session.last_section_index is not None else 0
-    if section_index < 0 or section_index >= len(sections):
-        raise ValueError("section_index out of range.")
-
-    section_key = _section_key_from_result(result, section_index)
-    tracks = (result.get("tracks") or {}).get(section_key, [])
+    tracks = _collect_tracks_for_export(state, section_index=section_index)
     midi_tracks: List[TrackOut] = []
     for track in tracks:
-        item = _track_payload_to_midi_track(track)
+        item = _to_track_out(track)
         if item is not None:
             midi_tracks.append(item)
 
     if not midi_tracks:
-        raise ValueError("No drums/bass tracks available for MIDI export in this section.")
+        return {
+            "ok": False,
+            "run_id": rid,
+            "phase": phase,
+            "ready": True,
+            "error": "no_tracks_for_export",
+            "message": "No exportable tracks available.",
+        }
 
-    out_dir = Path("data/midi_all")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if not out_filename:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_filename = f"mcp_section_{section_index}_{ts}.mid"
-    out_path = str(out_dir / out_filename)
+    concept = _dump_value(state.get("concept") or {})
+    bpm = int((concept.get("bpm") or 120))
 
-    bpm = int(((blueprint.get("concept") or {}).get("bpm")) or 120)
+    blueprint = _dump_value(state.get("blueprint") or {})
+    target_duration = float(blueprint.get("user_confirmed_duration_sec") or 0)
+
+    midi_dir = ROOT_DIR / "data" / "midi_all"
+    midi_dir.mkdir(parents=True, exist_ok=True)
+    out_path = midi_dir / _build_midi_filename(concept)
+
     render_tracks_to_midi(
         tracks=midi_tracks,
         bpm=bpm,
-        out_path=out_path,
+        out_path=str(out_path),
         strictness=1,
+        target_duration_sec=target_duration if target_duration > 0 else None,
     )
-    session.last_section_index = section_index
+
+    if section_index is not None:
+        session.last_section_index = int(section_index)
+    session.last_run_id = rid
     return {
+        "ok": True,
         "run_id": rid,
-        "out_path": out_path,
-        "tracks": [t.instrument for t in midi_tracks],
+        "phase": phase,
+        "ready": True,
+        "out_path": str(out_path),
         "bpm": bpm,
-        "section_index": int(section_index),
+        "track_count": len(midi_tracks),
+        "section_index": section_index,
     }
 
 
-@mcp.resource("music://current/concept")
-async def current_concept(ctx: Context = None) -> str:
+@mcp.resource("music://state/current")
+async def get_state_resource(ctx: Context = None) -> str:
+    """View current normalized state for the active session."""
     session = _get_session(ctx)
     if not session.last_run_id:
-        return "No concept available in this session."
-    status = await _ORCH.get_run_status(session.last_run_id)
-    concept = status.get("concept")
-    if concept:
-        return json.dumps(concept, indent=2, ensure_ascii=False)
-    return "No concept available in this run."
+        return json.dumps({"message": "No run in this session."}, ensure_ascii=False, indent=2)
 
-
-@mcp.resource("music://current/blueprint")
-async def current_blueprint(ctx: Context = None) -> str:
-    session = _get_session(ctx)
-    if not session.last_run_id:
-        return "No blueprint available in this session."
-    raw_state = await _ORCH.get_raw_state(session.last_run_id)
-    blueprint = raw_state.get("blueprint")
-    if blueprint:
-        return format_report(_dump_value(blueprint))
-    return (
-        "Blueprint is not available yet.\n"
-        "Call review_concept(approved=true, user_confirmed_duration_sec=...) first."
-    )
+    rid = session.last_run_id
+    state = await _get_state(rid)
+    out = _normalize_status(rid, state, message="resource_state")
+    out["concept"] = _dump_value(state.get("concept"))
+    out["blueprint"] = _dump_value(state.get("blueprint"))
+    out["track_keys"] = list((_dump_value(state.get("tracks") or {}) or {}).keys())
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
-    maybe_start_metrics_server()
     mcp.run()

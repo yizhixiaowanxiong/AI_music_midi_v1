@@ -1,60 +1,52 @@
-﻿"""概念层（Concept）schema。
-
-概念层只描述音乐目标与结构意图，不直接产出音符。
+﻿"""概念层（Concept）schema - 极速版
+只包含最核心的元数据，没有任何嵌套结构。
 """
-
 import re
-from typing import List
-
-from pydantic import BaseModel, Field, field_validator
-
-from schema.base import GrooveIntent, ScaleDefinition
-
-_TIME_SIGNATURE_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
+from typing import Any, Literal
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-class SectionConcept(BaseModel):
-    """概念段落：描述氛围与能量，不绑定具体小节排布。"""
-
-    name: str = Field(..., description="段落名，例如 Intro / Verse / Drop")
-    vibe: str = Field(..., description="段落氛围描述")
-    energy_curve: float = Field(..., ge=0.0, le=1.0, description="能量值，范围 [0.0, 1.0]")
-    reference_tags: List[str] = Field(default_factory=list, description="参考风格标签")
+def _unwrap_nested(data: Any, known_keys: set[str]) -> Any:
+    """LLM 有时返回 {"song_concept": {...}} 这种多余嵌套，在此自动解包。"""
+    if not isinstance(data, dict):
+        return data
+    # 如果顶层已经包含已知字段，直接返回
+    if known_keys & set(data.keys()):
+        return data
+    # 只有一个键且值是 dict → 尝试解包
+    if len(data) == 1:
+        inner = next(iter(data.values()))
+        if isinstance(inner, dict):
+            return inner
+    return data
 
 
 class SongConcept(BaseModel):
-    """歌曲概念：风格、节拍、调式与结构草图。"""
+    """歌曲概念：只包含全局元数据，不包含结构列表。"""
 
-    title: str
-    style_description: str
-    bpm: int = Field(..., gt=0, description="建议速度，必须 > 0")
-    time_signature: str = Field(..., description="拍号，格式如 4/4、3/4、6/8")
+    # 1. 核心风格 (简短准确，用于指导后续 Agent)
+    style_description: str = Field(..., description="风格核心描述，如 'Cyberpunk Industrial Techno'")
+    mood: str = Field(..., description="情感氛围关键词，如 'Dark, Aggressive'")
 
-    scale: ScaleDefinition
-    global_groove: GrooveIntent
-    structure_flow: List[SectionConcept]
-    suggested_duration_range: str = Field(..., description="建议时长范围，例如 180s-240s")
+    # 2. 音乐锚点 (扁平化，不要嵌套对象)
+    bpm: int = Field(..., gt=40, lt=300, description="BPM速度")
+    time_signature: str = Field("4/4", description="拍号")
+
+    # 3. 调式 (拆分为两个简单字段，不要 ScaleDefinition 对象)
+    key_root: str = Field(..., description="根音，如 'C', 'F#'")
+    key_mode: str = Field(..., description="调式，如 'Minor', 'Dorian'")
+
+    # 4. 时长预估 (用于后续规划总小节数)
+    target_duration_sec: int = Field(..., description="目标时长(秒)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap(cls, data: Any) -> Any:
+        return _unwrap_nested(data, {"style_description", "mood", "bpm", "key_root"})
 
     @field_validator("time_signature")
     @classmethod
-    def normalize_time_signature(cls, value: str) -> str:
-        match = _TIME_SIGNATURE_RE.match(str(value or ""))
-        if not match:
-            raise ValueError("time_signature must be in 'numerator/denominator' format")
-
-        numerator = int(match.group(1))
-        denominator = int(match.group(2))
-        if numerator <= 0 or denominator <= 0:
-            raise ValueError("time_signature numerator/denominator must be > 0")
-        if denominator not in (1, 2, 4, 8, 16, 32):
-            raise ValueError("time_signature denominator must be one of 1,2,4,8,16,32")
-
-        return f"{numerator}/{denominator}"
-
-    @field_validator("suggested_duration_range", mode="before")
-    @classmethod
-    def normalize_duration_range(cls, value):
-        """兼容 list/tuple 输入，统一收敛为字符串区间。"""
-        if isinstance(value, (list, tuple)) and len(value) >= 2:
-            return f"{value[0]}-{value[1]}"
-        return str(value or "")
+    def validate_ts(cls, v):
+        if not re.match(r"^\d+/\d+$", str(v)):
+            return "4/4" # 容错兜底
+        return v
